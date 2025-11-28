@@ -337,6 +337,66 @@ impl SimulationEngine {
     pub fn toggle_skill_evolution(&mut self, enabled: bool) {
         self.sim.config.enable_skill_evolution = enabled;
     }
+
+    /// Get retention statistics as JSON
+    pub fn get_retention_stats(&self) -> String {
+        serde_json::json!({
+            "per_bucket_continue_rate": self.sim.stats.per_bucket_continue_rate,
+            "avg_computed_continue_prob": self.sim.stats.avg_computed_continue_prob,
+            "sample_logits": self.sim.stats.sample_logits.clone(),
+            "sample_experiences": self.sim.stats.sample_experiences.clone(),
+            "current_retention_config": self.sim.stats.current_retention_config.clone(),
+            "avg_matches_per_session": self.sim.stats.avg_matches_per_session,
+            "active_sessions": self.sim.stats.active_sessions,
+            "total_sessions_completed": self.sim.stats.total_sessions_completed,
+            "churn_rate": self.sim.stats.churn_rate,
+            "players_leaving_rate": self.sim.stats.players_leaving_rate,
+            "population_change_rate": self.sim.stats.population_change_rate,
+            "recent_population_samples": self.sim.stats.recent_population_samples.clone(),
+            "per_bucket_return_rate": self.sim.stats.per_bucket_return_rate,
+            "total_return_attempts": self.sim.stats.total_return_attempts,
+            "total_returns": self.sim.stats.total_returns,
+        }).to_string()
+    }
+
+    /// Get churn rate
+    pub fn get_churn_rate(&self) -> f64 {
+        self.sim.stats.churn_rate
+    }
+
+    /// Get effective population size history (time series)
+    pub fn get_effective_population_history(&self) -> String {
+        let history: Vec<_> = self.sim.stats.effective_population_size_over_time.iter()
+            .map(|(tick, size)| {
+                serde_json::json!({
+                    "tick": tick,
+                    "population": size,
+                })
+            })
+            .collect();
+        serde_json::to_string(&history).unwrap_or_default()
+    }
+
+    /// Get return statistics as JSON
+    pub fn get_return_stats(&self) -> String {
+        serde_json::json!({
+            "per_bucket_return_rate": self.sim.stats.per_bucket_return_rate,
+            "churn_rate": self.sim.stats.churn_rate,
+            "total_return_attempts": self.sim.stats.total_return_attempts,
+            "total_returns": self.sim.stats.total_returns,
+            "churn_threshold_ticks": self.sim.stats.churn_threshold_ticks,
+        }).to_string()
+    }
+
+    /// Get session statistics as JSON
+    pub fn get_session_stats(&self) -> String {
+        serde_json::json!({
+            "session_length_distribution": self.sim.stats.session_length_distribution,
+            "avg_matches_per_session": self.sim.stats.avg_matches_per_session,
+            "active_sessions": self.sim.stats.active_sessions,
+            "total_sessions_completed": self.sim.stats.total_sessions_completed,
+        }).to_string()
+    }
 }
 
 /// Run a parameter sweep experiment

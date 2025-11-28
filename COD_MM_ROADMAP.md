@@ -62,7 +62,9 @@ The Rust/WASM engine (`src/`) already implements:
 - ✅ Performance model with per-match performance indices
 - ✅ Skill evolution system with update rule and batch percentile recalculation
 - ✅ Skill distribution evolution tracking over time
-- ✅ Basic retention/continuation logic
+- ✅ Formal retention model with logistic function and experience vectors
+- ✅ Return probability model (between-sessions)
+- ✅ Population health tracking (effective population size, population change rate)
 - ✅ Per-bucket statistics
 - ✅ Blowout severity tracking and per-playlist metrics
 
@@ -77,6 +79,10 @@ The React frontend (`web/src/`) provides:
 - ✅ Skill evolution visualizations (time series, current distribution, drift metrics)
 - ✅ Performance distribution charts
 - ✅ Skill evolution toggle and configuration controls
+- ✅ Retention model diagnostic panel with computed probabilities and config values
+- ✅ Population change rate metric (tracks rate of change of effective population)
+- ✅ Retention model diagnostic panel with computed probabilities and config values
+- ✅ Population change rate metric (replaces "Players Leaving" rate for better population health tracking)
 
 ---
 
@@ -95,7 +101,7 @@ The React frontend (`web/src/`) provides:
 | **Team Balancing** | §3.6 | `balance_teams()` with exact partitioning for 6v6 | ✅ Complete (exact for small, snake draft for large) |
 | **Match Outcomes** | §3.7 | `determine_outcome()` with configurable logistic and blowout severity | ✅ Complete (includes performance model) |
 | **Skill Evolution** | §3.7 | Performance model and skill update rule implemented | ✅ Complete |
-| **Retention Model** | §3.8 | Inline continuation probability | ⚠️ Ad-hoc (not formal logistic) |
+| **Retention Model** | §3.8 | Formal logistic model with experience vectors, return probability | ✅ Complete |
 | **Parties** | §2.4, §2.7 | `Party` struct with full integration | ✅ Complete |
 | **Region Graph** | §2.3, §6.1 | Regions as strings, no adjacency | ⚠️ Implicit (needs explicit) |
 | **Under-full Lobbies** | §6.8 | Exact size match only | ⚠️ Missing |
@@ -323,14 +329,18 @@ Each vertical slice is a self-contained feature that touches engine, metrics, an
 
 ---
 
-### Slice E: Satisfaction, Continuation, and Retention Modeling
+### Slice E: Satisfaction, Continuation, and Retention Modeling ✅ **COMPLETE**
 
 **Whitepaper References**: §3.8 (satisfaction, quit probability), §6.9 (KPIs)
 
+**Status**: ✅ **Completed** (including return probability)
+
 **Goals**:
-- Replace ad-hoc continuation logic with formal logistic model
-- Define experience vector and parameterized retention function
-- Track per-bucket retention metrics
+- ✅ Replace ad-hoc continuation logic with formal logistic model
+- ✅ Define experience vector and parameterized retention function
+- ✅ Track per-bucket retention metrics
+- ✅ Implement return probability model (between-sessions)
+- ✅ Track effective population size and churn rate
 
 **Engine Work**:
 - **`src/types.rs`**:
@@ -372,10 +382,24 @@ Each vertical slice is a self-contained feature that touches engine, metrics, an
 - Add chart: average matches per session over time
 
 **Metrics & Experiments**:
-- Track: continuation rate by bucket, matches per session, effective population size (concurrent players)
-- Experiment: Compare population health (total concurrent players) with different retention models
+- ✅ Track: continuation rate by bucket, matches per session, effective population size (concurrent players)
+- ✅ Track: return rate by bucket, churn rate, effective population size over time
+- ✅ Track: population change rate (first derivative of effective population, players per second)
+- ✅ Diagnostic: average computed continue probability, logit values, experience values, and active config
+- ✅ Experiment: Compare population health (total concurrent players, population change rate) with different retention models (Experiment 3 ready)
 
-**Dependencies**: Slice D (performance model) recommended for complete experience vector
+**Return Probability Implementation**:
+- ✅ Added `compute_return_probability()` using same logistic model as continuation
+- ✅ Modified `process_arrivals()` to use return probability (threshold-based selection)
+- ✅ Preserve last session experience when players quit (goes to `last_session_experience`)
+- ✅ Track churn rate (players offline > threshold without returning)
+- ✅ Track effective population size over time (sampled every 10 ticks)
+- ✅ Track return rate by skill bucket
+- ✅ Track population change rate (rate of change of effective population, players per second)
+- ✅ Frontend charts: Effective Population Size Over Time, Population Change Rate metric, Return Rate by Skill Bucket
+- ✅ Diagnostic panel: Shows average computed continue probability, logit values, experience values, and active retention config for debugging
+
+**Dependencies**: Slice D (performance model) ✅ - completed, provides complete experience vector
 
 ---
 
@@ -572,22 +596,28 @@ Phases group slices into logical execution order. Each phase produces working ar
 
 ### Phase 3: Player Behavior & Regional Analysis
 
-**Slices**: E (Retention) + F (Regions)
+**Slices**: E (Retention) ✅ **COMPLETE** + F (Regions)
 
 **Goal**: Model player satisfaction and enable regional analysis.
 
 **Deliverables**:
-- Formal retention model with experience vector
-- Region adjacency graph and region-aware backoff
-- Per-region metrics and analysis
-- Retention presets (ping-first, skill-first, etc.)
+- ✅ Formal retention model with experience vector
+- ✅ Return probability model (between-sessions)
+- ✅ Effective population size and churn tracking
+- ⚠️ Region adjacency graph and region-aware backoff (Slice F - pending)
+- ⚠️ Per-region metrics and analysis (Slice F - pending)
+- ✅ Retention presets (ping-first, skill-first, lenient, strict)
+- ✅ Population change rate metric (tracks rate of change of effective population)
+- ✅ Diagnostic panel for retention model debugging
 
 **Validation**:
-- Compare population health (concurrent players) with different retention models
-- Analyze regional differences: search times, delta ping, blowout rates
-- Verify low-population regions can spill into adjacent regions
+- ✅ Compare population health (concurrent players, population change rate) with different retention models (Experiment 3 ready)
+- ⚠️ Analyze regional differences: search times, delta ping, blowout rates (Slice F - pending)
+- ⚠️ Verify low-population regions can spill into adjacent regions (Slice F - pending)
 
-**Estimated Effort**: 2-3 weeks
+**Status**: Slice E complete with return probability and population health metrics. Slice F (Regions) remains.
+
+**Estimated Effort**: 2-3 weeks (Slice E: ✅ Complete, Slice F: pending)
 
 ---
 
@@ -684,17 +714,20 @@ This section documents canonical experiments that can be run once the relevant s
 
 ---
 
-### Experiment 3: Retention Model Comparison
+### Experiment 3: Retention Model Comparison ✅ **READY**
 
-**Dependencies**: Slices E, D
+**Dependencies**: Slices E ✅, D ✅
 
 **Parameters**: Compare retention presets: "Ping-First", "Skill-First", "Lenient", "Strict"
 
 **Metrics to Track**:
-- Effective population size (concurrent players) over time
-- Average matches per session
-- Continuation rate by skill bucket
-- Churn rate
+- ✅ Effective population size (concurrent players) over time
+- ✅ Population change rate (players per second, positive = growing, negative = shrinking)
+- ✅ Average matches per session
+- ✅ Continuation rate by skill bucket
+- ✅ Churn rate
+- ✅ Return rate by skill bucket
+- ✅ Diagnostic metrics: average computed continue probability, logit values, experience values
 
 **Expected Results**:
 - Ping-First → higher retention for low-ping players, lower for high-ping
@@ -703,6 +736,8 @@ This section documents canonical experiments that can be run once the relevant s
 - Strict → lower retention but better match quality
 
 **Config Preset**: `experiments/retention_model_comparison.json`
+
+**Status**: All dependencies complete. Experiment can be run with full return probability and population health tracking.
 
 ---
 

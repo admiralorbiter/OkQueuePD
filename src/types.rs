@@ -193,8 +193,24 @@ pub struct Player {
     /// Recent performance indices from matches (rolling window)
     pub recent_performance: Vec<f64>,
     
-    /// Continuation probability (search again after match)
+    /// Continuation probability (search again after match) - kept for backward compatibility
+    /// Will be computed dynamically using retention model
     pub continuation_prob: f64,
+    
+    /// Recent experience vectors (last N matches) for retention model
+    pub recent_experience: Vec<ExperienceVector>,
+    
+    /// Session tracking: when current session started (tick)
+    pub session_start_time: Option<u64>,
+    
+    /// Session tracking: number of matches played in current session
+    pub matches_in_session: usize,
+    
+    /// Return probability tracking: experience from last completed session
+    pub last_session_experience: Vec<ExperienceVector>,
+    
+    /// Return probability tracking: when player last went offline (tick)
+    pub last_session_end_time: Option<u64>,
 }
 
 impl Player {
@@ -229,6 +245,11 @@ impl Player {
             recent_blowouts: Vec::new(),
             recent_performance: Vec::new(),
             continuation_prob: 0.85,
+            recent_experience: Vec::new(),
+            session_start_time: None,
+            matches_in_session: 0,
+            last_session_experience: Vec::new(),
+            last_session_end_time: None,
         }
     }
 
@@ -497,6 +518,42 @@ pub enum BlowoutSeverity {
     Severe,    // Significant skill gap
 }
 
+/// Experience vector for a single match
+/// Per whitepaper §3.8: z_i = (Δp_i, T^search_i, blowout flag, KPM_i, placement percentile, ...)
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExperienceVector {
+    /// Average delta ping in this match (ms)
+    pub avg_delta_ping: f64,
+    /// Search time for this match (seconds)
+    pub avg_search_time: f64,
+    /// Whether this match was a blowout
+    pub was_blowout: bool,
+    /// Whether player won this match
+    pub won: bool,
+    /// Performance index from match (0-1 scale)
+    pub performance: f64,
+}
+
+/// Retention model configuration
+/// Per whitepaper §3.8: P(continue) = σ(θ^T z_i)
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RetentionConfig {
+    /// Coefficient for delta ping (typically negative: high ping reduces retention)
+    pub theta_ping: f64,
+    /// Coefficient for search time (typically negative: long waits reduce retention)
+    pub theta_search_time: f64,
+    /// Coefficient for blowout rate (typically negative: blowouts reduce retention)
+    pub theta_blowout: f64,
+    /// Coefficient for win rate (typically positive: winning increases retention)
+    pub theta_win_rate: f64,
+    /// Coefficient for performance (typically positive: good performance increases retention)
+    pub theta_performance: f64,
+    /// Base logit (before experience terms) - maps to base probability via logistic
+    pub base_continue_prob: f64,
+    /// How many recent matches to include in experience vector
+    pub experience_window_size: usize,
+}
+
 /// An active match
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Match {
@@ -595,6 +652,9 @@ pub struct MatchmakingConfig {
     pub enable_skill_evolution: bool,
     /// Update skill percentiles every N matches (batch size)
     pub skill_update_batch_size: usize,
+    
+    /// Retention model configuration
+    pub retention_config: RetentionConfig,
 }
 
 impl Default for MatchmakingConfig {
@@ -634,6 +694,15 @@ impl Default for MatchmakingConfig {
             performance_noise_std: 0.15,
             enable_skill_evolution: true,
             skill_update_batch_size: 10,
+            retention_config: RetentionConfig {
+                theta_ping: -0.02,
+                theta_search_time: -0.015,
+                theta_blowout: -0.5,
+                theta_win_rate: 0.8,
+                theta_performance: 0.6,
+                base_continue_prob: 0.0,
+                experience_window_size: 5,
+            },
         }
     }
 }
@@ -731,6 +800,51 @@ pub struct SimulationStats {
     pub total_skill_updates: usize,
     /// Distribution of performance indices
     pub performance_samples: Vec<f64>,
+    
+    /// Retention model metrics
+    /// Continuation rate by skill bucket (bucket_id -> continuation_rate)
+    pub per_bucket_continue_rate: HashMap<usize, f64>,
+    /// Average computed continue probability (diagnostic)
+    pub avg_computed_continue_prob: f64,
+    /// Diagnostic: sample logit values (for debugging)
+    pub sample_logits: Vec<f64>,
+    /// Diagnostic: sample experience values (for debugging)
+    pub sample_experiences: Vec<(f64, f64, f64, f64, f64)>, // (delta_ping, search_time, blowout_rate, win_rate, performance)
+    /// Diagnostic: current retention config (for verification)
+    pub current_retention_config: Option<RetentionConfig>,
+    /// Average matches per session
+    pub avg_matches_per_session: f64,
+    /// Session length distribution (histogram: index = matches, value = count)
+    pub session_length_distribution: Vec<usize>,
+    /// Number of players currently in a session (IN_LOBBY, SEARCHING, or IN_MATCH)
+    pub active_sessions: usize,
+    /// Total number of completed sessions (for calculating averages)
+    pub total_sessions_completed: usize,
+    
+    /// Return probability and churn metrics
+    /// Churn rate (fraction of total population currently offline for > threshold)
+    /// Note: This is a snapshot - players can return, so churn rate can decrease
+    pub churn_rate: f64,
+    /// Effective population size over time (time series: (tick, concurrent_players))
+    pub effective_population_size_over_time: Vec<(u64, usize)>,
+    /// Return rate by skill bucket (bucket_id -> return_rate)
+    pub per_bucket_return_rate: HashMap<usize, f64>,
+    /// Total offline players considered for return
+    pub total_return_attempts: usize,
+    /// Total players who actually returned
+    pub total_returns: usize,
+    /// Time threshold for churn calculation (ticks)
+    pub churn_threshold_ticks: u64,
+    /// Players leaving rate (quits per second, rolling average)
+    pub players_leaving_rate: f64,
+    /// Recent quits count (for calculating leaving rate)
+    pub recent_quits: Vec<(u64, usize)>, // (tick, quit_count)
+    /// Population change rate (players per second, positive = growing, negative = shrinking)
+    pub population_change_rate: f64,
+    /// Population history for trend calculation (last 200 ticks)
+    pub population_history: Vec<(u64, usize)>, // (tick, effective_population)
+    /// Diagnostic: recent population values for debugging
+    pub recent_population_samples: Vec<usize>, // Last 10 effective population values
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

@@ -77,6 +77,16 @@ const defaultConfig = {
   performanceNoiseStd: 0.15,
   enableSkillEvolution: true,
   skillUpdateBatchSize: 10,
+  // Retention model configuration
+  retentionConfig: {
+    thetaPing: -0.02,
+    thetaSearchTime: -0.015,
+    thetaBlowout: -0.5,
+    thetaWinRate: 0.8,
+    thetaPerformance: 0.6,
+    baseContinueProb: 0.0,
+    experienceWindowSize: 5,
+  },
 };
 
 // ============================================================================
@@ -114,6 +124,10 @@ export default function MatchmakingSimulator() {
   const [parties, setParties] = useState([]);
   const [skillEvolutionData, setSkillEvolutionData] = useState([]);
   const [performanceDistribution, setPerformanceDistribution] = useState([]);
+  const [retentionStats, setRetentionStats] = useState(null);
+  const [sessionStats, setSessionStats] = useState(null);
+  const [effectivePopulationHistory, setEffectivePopulationHistory] = useState([]);
+  const [returnStats, setReturnStats] = useState(null);
   const animationRef = useRef(null);
 
   // Initialize WASM on mount
@@ -173,6 +187,15 @@ export default function MatchmakingSimulator() {
       performance_noise_std: jsConfig.performanceNoiseStd ?? 0.15,
       enable_skill_evolution: jsConfig.enableSkillEvolution ?? true,
       skill_update_batch_size: jsConfig.skillUpdateBatchSize ?? 10,
+      retention_config: {
+        theta_ping: jsConfig.retentionConfig?.thetaPing ?? -0.02,
+        theta_search_time: jsConfig.retentionConfig?.thetaSearchTime ?? -0.015,
+        theta_blowout: jsConfig.retentionConfig?.thetaBlowout ?? -0.5,
+        theta_win_rate: jsConfig.retentionConfig?.thetaWinRate ?? 0.8,
+        theta_performance: jsConfig.retentionConfig?.thetaPerformance ?? 0.6,
+        base_continue_prob: jsConfig.retentionConfig?.baseContinueProb ?? 0.0,
+        experience_window_size: jsConfig.retentionConfig?.experienceWindowSize ?? 5,
+      },
     };
   }, []);
 
@@ -233,6 +256,14 @@ export default function MatchmakingSimulator() {
         // Slice D: Skill evolution metrics
         skillEvolutionEnabled: rawStats.skill_evolution_enabled || false,
         totalSkillUpdates: rawStats.total_skill_updates || 0,
+        // Slice E: Retention metrics
+        perBucketContinueRate: rawStats.per_bucket_continue_rate || {},
+        avgMatchesPerSession: rawStats.avg_matches_per_session || 0,
+        sessionLengthDistribution: rawStats.session_length_distribution || [],
+        activeSessions: rawStats.active_sessions || 0,
+        totalSessionsCompleted: rawStats.total_sessions_completed || 0,
+        // Population health
+        populationChangeRate: rawStats.population_change_rate || 0,
         // Time series data
         timeSeriesData: [],
       };
@@ -321,6 +352,13 @@ export default function MatchmakingSimulator() {
               // Slice D: Skill evolution metrics
               skillEvolutionEnabled: rawStats.skill_evolution_enabled || false,
               totalSkillUpdates: rawStats.total_skill_updates || 0,
+              // Slice E: Retention metrics
+              perBucketContinueRate: rawStats.per_bucket_continue_rate || {},
+              avgMatchesPerSession: rawStats.avg_matches_per_session || 0,
+              sessionLengthDistribution: rawStats.session_length_distribution || [],
+              activeSessions: rawStats.active_sessions || 0,
+              totalSessionsCompleted: rawStats.total_sessions_completed || 0,
+              populationChangeRate: prevStats?.populationChangeRate ?? 0,
               // Time series data (preserve from previous or initialize)
               timeSeriesData: prevStats?.timeSeriesData || [],
             };
@@ -335,6 +373,30 @@ export default function MatchmakingSimulator() {
                 const perfDistJson = sim.get_performance_distribution(20);
                 const perfDist = JSON.parse(perfDistJson);
                 setPerformanceDistribution(perfDist);
+                
+                // Fetch retention and session stats
+                const retentionJson = sim.get_retention_stats();
+                const retention = JSON.parse(retentionJson);
+                setRetentionStats(retention);
+                
+                // Update population change rate in stats
+                setStats(prev => ({ 
+                  ...prev, 
+                  populationChangeRate: retention?.population_change_rate ?? prev.populationChangeRate ?? 0 
+                }));
+                
+                const sessionJson = sim.get_session_stats();
+                const session = JSON.parse(sessionJson);
+                setSessionStats(session);
+                
+                // Fetch return probability and population health stats
+                const returnJson = sim.get_return_stats();
+                const returnData = JSON.parse(returnJson);
+                setReturnStats(returnData);
+                
+                const populationHistoryJson = sim.get_effective_population_history();
+                const populationHistory = JSON.parse(populationHistoryJson);
+                setEffectivePopulationHistory(populationHistory);
               }
             } catch (e) {
               console.error('Error fetching skill evolution data:', e);
@@ -409,7 +471,15 @@ export default function MatchmakingSimulator() {
 
   const updateConfig = (key, value) => {
     setConfig(prev => {
-      const newConfig = { ...prev, [key]: parseFloat(value) };
+      let newConfig;
+      // Handle nested objects (e.g., retentionConfig)
+      if (key === 'retentionConfig' && typeof value === 'object') {
+        newConfig = { ...prev, retentionConfig: { ...prev.retentionConfig, ...value } };
+      } else {
+        // Handle simple key-value pairs
+        newConfig = { ...prev, [key]: typeof value === 'number' ? value : parseFloat(value) };
+      }
+      
       // If arrival rate is being updated manually, don't auto-scale it
       if (key === 'arrivalRate') {
         // Update WASM sim if it exists
@@ -422,10 +492,14 @@ export default function MatchmakingSimulator() {
         }
         return newConfig;
       }
-      // Update WASM sim config
+      
+      // Update WASM sim config for all other changes
       if (sim && wasmReady) {
         try {
           const rustConfig = convertConfigToRust(newConfig);
+          if (key === 'retentionConfig') {
+            console.log('Updating retention config:', JSON.stringify(newConfig.retentionConfig, null, 2));
+          }
           sim.update_config(JSON.stringify(rustConfig));
         } catch (error) {
           console.error('Failed to update config:', error);
@@ -778,6 +852,77 @@ export default function MatchmakingSimulator() {
                 </label>
               ))}
             </div>
+            <div style={{ marginTop: '1rem', paddingTop: '1rem', borderTop: `1px solid ${COLORS.border}` }}>
+              <h4 style={{ fontSize: '0.65rem', color: COLORS.textMuted, marginBottom: '0.5rem' }}>RETENTION MODEL</h4>
+              <div style={{ marginBottom: '0.75rem', display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                {[
+                  { name: 'Ping-First', config: { thetaPing: -0.05, thetaSearchTime: -0.01, thetaBlowout: -0.3, thetaWinRate: 0.5, thetaPerformance: 0.4 } },
+                  { name: 'Skill-First', config: { thetaPing: -0.01, thetaSearchTime: -0.01, thetaBlowout: -0.3, thetaWinRate: 1.2, thetaPerformance: 1.0 } },
+                  { name: 'Lenient', config: { thetaPing: -0.01, thetaSearchTime: -0.005, thetaBlowout: -0.2, thetaWinRate: 0.6, thetaPerformance: 0.5 } },
+                  { name: 'Strict', config: { thetaPing: -0.03, thetaSearchTime: -0.025, thetaBlowout: -0.8, thetaWinRate: 1.0, thetaPerformance: 0.8 } },
+                ].map((preset) => (
+                  <button
+                    key={preset.name}
+                    onClick={() => {
+                      const newConfig = {
+                        ...config,
+                        retentionConfig: {
+                          ...config.retentionConfig,
+                          ...preset.config,
+                        },
+                      };
+                      updateConfig('retentionConfig', newConfig.retentionConfig);
+                    }}
+                    style={{
+                      padding: '0.25rem 0.5rem',
+                      fontSize: '0.6rem',
+                      background: COLORS.card,
+                      border: `1px solid ${COLORS.border}`,
+                      color: COLORS.text,
+                      cursor: 'pointer',
+                      borderRadius: '4px',
+                    }}
+                  >
+                    {preset.name}
+                  </button>
+                ))}
+              </div>
+              {[
+                ['retentionConfig.thetaPing', 'Theta Ping', -0.1, 0.0],
+                ['retentionConfig.thetaSearchTime', 'Theta Search Time', -0.05, 0.0],
+                ['retentionConfig.thetaBlowout', 'Theta Blowout', -1.0, 0.0],
+                ['retentionConfig.thetaWinRate', 'Theta Win Rate', 0.0, 2.0],
+                ['retentionConfig.thetaPerformance', 'Theta Performance', 0.0, 2.0],
+                ['retentionConfig.baseContinueProb', 'Base Continue Prob', -2.0, 2.0],
+                ['retentionConfig.experienceWindowSize', 'Experience Window Size', 1, 20],
+              ].map(([key, label, min, max]) => {
+                const fieldName = key.split('.')[1]; // Extract field name (e.g., 'thetaPing')
+                const value = config.retentionConfig?.[fieldName];
+                const currentValue = typeof value === 'number' ? value : (key.includes('WindowSize') ? 5 : 0);
+                // Clamp value to valid range for display
+                const clampedValue = Math.max(min, Math.min(max, currentValue));
+                return (
+                  <label key={key} style={{ display: 'block', marginBottom: '0.5rem' }}>
+                    <span style={{ fontSize: '0.65rem', color: COLORS.textMuted }}>
+                      {label}: {key.includes('WindowSize') ? clampedValue.toFixed(0) : clampedValue.toFixed(3)}
+                    </span>
+                    <input
+                      type="range"
+                      min={min}
+                      max={max}
+                      step={key.includes('WindowSize') ? 1 : (max - min) / 200}
+                      value={clampedValue}
+                      onChange={(e) => {
+                        const newValue = key.includes('WindowSize') ? parseInt(e.target.value) : parseFloat(e.target.value);
+                        const newRetentionConfig = { ...config.retentionConfig, [fieldName]: newValue };
+                        updateConfig('retentionConfig', newRetentionConfig);
+                      }}
+                      style={{ width: '100%', accentColor: COLORS.tertiary }}
+                    />
+                  </label>
+                );
+              })}
+            </div>
           </div>
 
           <div>
@@ -849,9 +994,9 @@ export default function MatchmakingSimulator() {
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '0.75rem', marginBottom: '1rem' }}>
                 {[
                   { label: 'Total Players', value: stats.totalPlayers || 0, color: COLORS.text, sub: `Population: ${population.toLocaleString()}` },
+                  { label: 'Effective Population', value: (stats.InLobby || 0) + (stats.Searching || 0) + (stats.InMatch || 0), color: COLORS.primary, sub: 'Concurrent (active)' },
                   { label: 'Players Searching', value: stats.Searching, color: COLORS.warning },
                   { label: 'Players In Match', value: stats.InMatch, color: COLORS.success },
-                  { label: 'Active Matches', value: stats.activeMatches, color: COLORS.tertiary },
                 ].map(({ label, value, color, sub }) => (
                   <div key={label} style={{
                     background: COLORS.card,
@@ -867,13 +1012,19 @@ export default function MatchmakingSimulator() {
               </div>
 
               {/* Key Metrics */}
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '0.75rem', marginBottom: '1rem' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: '0.75rem', marginBottom: '1rem' }}>
                 {[
                   { label: 'Avg Search Time', value: `${stats.avgSearchTime.toFixed(1)}s`, sub: `P90: ${stats.searchTimeP90.toFixed(1)}s` },
                   { label: 'Avg Delta Ping', value: `${stats.avgDeltaPing.toFixed(1)}ms`, sub: `P90: ${stats.deltaPingP90.toFixed(1)}ms` },
                   { label: 'Skill Disparity', value: stats.avgSkillDisparity.toFixed(3), sub: 'Avg lobby spread' },
                   { label: 'Blowout Rate', value: `${(stats.blowoutRate * 100).toFixed(1)}%`, sub: 'Unbalanced matches' },
-                ].map(({ label, value, sub }) => (
+                  { 
+                    label: 'Population Change', 
+                    value: `${((stats?.populationChangeRate || 0) >= 0 ? '+' : '')}${(stats?.populationChangeRate || 0).toFixed(2)}/s`, 
+                    sub: (stats?.populationChangeRate || 0) >= 0 ? 'Growing' : 'Shrinking',
+                    color: (stats?.populationChangeRate || 0) >= 0 ? COLORS.success : COLORS.danger
+                  },
+                ].map(({ label, value, sub, color }) => (
                   <div key={label} style={{
                     background: `linear-gradient(135deg, ${COLORS.card}, ${COLORS.darker})`,
                     border: `1px solid ${COLORS.border}`,
@@ -881,7 +1032,7 @@ export default function MatchmakingSimulator() {
                     padding: '1rem',
                   }}>
                     <div style={{ fontSize: '0.65rem', color: COLORS.textMuted }}>{label}</div>
-                    <div style={{ fontSize: '1.25rem', fontWeight: 600, color: COLORS.text }}>{value}</div>
+                    <div style={{ fontSize: '1.25rem', fontWeight: 600, color: color || COLORS.text }}>{value}</div>
                     <div style={{ fontSize: '0.6rem', color: COLORS.textMuted }}>{sub}</div>
                   </div>
                 ))}
@@ -1275,6 +1426,160 @@ export default function MatchmakingSimulator() {
                   </ResponsiveContainer>
                 </div>
               </div>
+              
+              {/* Slice E: Retention Model Charts */}
+              <div style={{ marginTop: '0.75rem' }}>
+                <div style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: '8px', padding: '1rem', marginBottom: '0.75rem' }}>
+                  <h4 style={{ fontSize: '0.75rem', color: COLORS.textMuted, marginBottom: '0.5rem' }}>CONTINUATION RATE BY SKILL BUCKET</h4>
+                  <ResponsiveContainer width="100%" height={300}>
+                    <BarChart data={(() => {
+                      if (!retentionStats?.per_bucket_continue_rate) return [];
+                      return Object.entries(retentionStats.per_bucket_continue_rate).map(([bucket, rate]) => ({
+                        bucket: parseInt(bucket),
+                        rate: rate,
+                        ratePercent: (rate * 100).toFixed(1),
+                      })).sort((a, b) => a.bucket - b.bucket);
+                    })()}>
+                      <CartesianGrid strokeDasharray="3 3" stroke={COLORS.border} />
+                      <XAxis dataKey="bucket" tick={{ fill: COLORS.textMuted, fontSize: 10 }} label={{ value: 'Skill Bucket', position: 'insideBottom', offset: -5, fill: COLORS.textMuted }} />
+                      <YAxis tick={{ fill: COLORS.textMuted, fontSize: 10 }} domain={[0, 1]} tickFormatter={(v) => `${(v*100).toFixed(0)}%`} />
+                      <Tooltip contentStyle={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }} formatter={(v) => `${(v*100).toFixed(1)}%`} />
+                      <Bar dataKey="rate" fill={COLORS.primary} radius={[2, 2, 0, 0]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+                
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem' }}>
+                  <div style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: '8px', padding: '1rem' }}>
+                    <h4 style={{ fontSize: '0.75rem', color: COLORS.textMuted, marginBottom: '0.5rem' }}>SESSION LENGTH DISTRIBUTION</h4>
+                    <ResponsiveContainer width="100%" height={250}>
+                      <BarChart data={(() => {
+                        if (!sessionStats?.session_length_distribution) return [];
+                        return sessionStats.session_length_distribution.map((count, matches) => ({
+                          matches,
+                          count,
+                        })).filter(d => d.count > 0).slice(0, 20);
+                      })()}>
+                        <CartesianGrid strokeDasharray="3 3" stroke={COLORS.border} />
+                        <XAxis dataKey="matches" tick={{ fill: COLORS.textMuted, fontSize: 10 }} label={{ value: 'Matches per Session', position: 'insideBottom', offset: -5, fill: COLORS.textMuted }} />
+                        <YAxis tick={{ fill: COLORS.textMuted, fontSize: 10 }} />
+                        <Tooltip contentStyle={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }} />
+                        <Bar dataKey="count" fill={COLORS.secondary} radius={[2, 2, 0, 0]} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                  
+                  <div style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: '8px', padding: '1rem' }}>
+                    <h4 style={{ fontSize: '0.75rem', color: COLORS.textMuted, marginBottom: '0.5rem' }}>RETENTION METRICS</h4>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                      <div style={{ fontSize: '0.7rem', color: COLORS.text }}>
+                        Avg Matches/Session: <span style={{ color: COLORS.primary }}>{sessionStats?.avg_matches_per_session?.toFixed(2) ?? '0.00'}</span>
+                      </div>
+                      <div style={{ fontSize: '0.7rem', color: COLORS.text }}>
+                        Active Sessions: <span style={{ color: COLORS.primary }}>{retentionStats?.active_sessions ?? 0}</span>
+                      </div>
+                      <div style={{ fontSize: '0.7rem', color: COLORS.text }}>
+                        Total Sessions: <span style={{ color: COLORS.primary }}>{sessionStats?.total_sessions_completed ?? 0}</span>
+                      </div>
+                      <div style={{ fontSize: '0.7rem', color: COLORS.text }}>
+                        Population Change: <span style={{ color: ((stats?.populationChangeRate || 0) >= 0 ? COLORS.success : COLORS.danger) }}>
+                          {((stats?.populationChangeRate || 0) >= 0 ? '+' : '')}{(stats?.populationChangeRate || 0).toFixed(2)}/s
+                        </span>
+                        <span style={{ fontSize: '0.6rem', color: COLORS.textMuted, marginLeft: '0.25rem' }}>
+                          ({((stats?.populationChangeRate || 0) >= 0 ? 'growing' : 'shrinking')})
+                        </span>
+                        {retentionStats?.recent_population_samples && retentionStats.recent_population_samples.length > 0 && (
+                          <div style={{ fontSize: '0.55rem', color: COLORS.textMuted, marginTop: '0.15rem', fontStyle: 'italic' }}>
+                            Recent: {retentionStats.recent_population_samples.slice(-5).join(', ')}
+                          </div>
+                        )}
+                      </div>
+                      <div style={{ fontSize: '0.7rem', color: COLORS.text }}>
+                        Total Returns: <span style={{ color: COLORS.primary }}>{returnStats?.total_returns ?? 0}</span>
+                      </div>
+                      <div style={{ fontSize: '0.7rem', color: COLORS.text, marginTop: '0.5rem', paddingTop: '0.5rem', borderTop: `2px solid ${COLORS.quaternary}`, backgroundColor: `${COLORS.darker}40` }}>
+                        <div style={{ fontSize: '0.7rem', color: COLORS.quaternary, fontWeight: 600, marginBottom: '0.25rem' }}>🔍 DIAGNOSTIC DATA</div>
+                        <div style={{ fontSize: '0.65rem', color: COLORS.text, marginBottom: '0.15rem' }}>
+                          Avg Continue Prob: <span style={{ color: COLORS.quaternary, fontWeight: 600 }}>{(retentionStats?.avg_computed_continue_prob ?? 0).toFixed(3)}</span>
+                          <span style={{ fontSize: '0.6rem', color: COLORS.textMuted, marginLeft: '0.25rem' }}>
+                            ({(retentionStats?.avg_computed_continue_prob ?? 0) * 100}% continue, {(1 - (retentionStats?.avg_computed_continue_prob ?? 0)) * 100}% quit)
+                          </span>
+                        </div>
+                        {retentionStats?.sample_logits && retentionStats.sample_logits.length > 0 ? (
+                          <>
+                            <div style={{ fontSize: '0.65rem', color: COLORS.text, marginBottom: '0.15rem' }}>
+                              Avg Logit: <span style={{ color: COLORS.primary }}>{(retentionStats.sample_logits.reduce((a, b) => a + b, 0) / retentionStats.sample_logits.length).toFixed(2)}</span>
+                            </div>
+                            {retentionStats?.sample_experiences && retentionStats.sample_experiences.length > 0 && (
+                              <div style={{ fontSize: '0.65rem', color: COLORS.text, marginBottom: '0.15rem' }}>
+                                Avg Experience: 
+                                <span style={{ marginLeft: '0.25rem' }}>
+                                  δP=<span style={{ color: COLORS.primary }}>{(retentionStats.sample_experiences.reduce((a, b) => a + b[0], 0) / retentionStats.sample_experiences.length).toFixed(1)}</span>ms,
+                                  ST=<span style={{ color: COLORS.primary }}>{(retentionStats.sample_experiences.reduce((a, b) => a + b[1], 0) / retentionStats.sample_experiences.length).toFixed(1)}</span>s,
+                                  WR=<span style={{ color: COLORS.primary }}>{(retentionStats.sample_experiences.reduce((a, b) => a + b[3], 0) / retentionStats.sample_experiences.length * 100).toFixed(0)}</span>%,
+                                  Perf=<span style={{ color: COLORS.primary }}>{(retentionStats.sample_experiences.reduce((a, b) => a + b[4], 0) / retentionStats.sample_experiences.length).toFixed(2)}</span>
+                                </span>
+                              </div>
+                            )}
+                            {retentionStats?.current_retention_config && (
+                              <div style={{ fontSize: '0.65rem', color: COLORS.text, marginTop: '0.25rem', paddingTop: '0.25rem', borderTop: `1px solid ${COLORS.border}` }}>
+                                <div style={{ fontWeight: 600, marginBottom: '0.1rem' }}>Active Config:</div>
+                                <div style={{ fontSize: '0.6rem', color: COLORS.textMuted }}>
+                                  θPing: <span style={{ color: COLORS.primary }}>{retentionStats.current_retention_config.theta_ping?.toFixed(3) ?? 'N/A'}</span> | 
+                                  θSearchTime: <span style={{ color: COLORS.primary }}>{retentionStats.current_retention_config.theta_search_time?.toFixed(3) ?? 'N/A'}</span> | 
+                                  θBlowout: <span style={{ color: COLORS.primary }}>{retentionStats.current_retention_config.theta_blowout?.toFixed(3) ?? 'N/A'}</span>
+                                </div>
+                                <div style={{ fontSize: '0.6rem', color: COLORS.textMuted }}>
+                                  θWinRate: <span style={{ color: COLORS.primary }}>{retentionStats.current_retention_config.theta_win_rate?.toFixed(3) ?? 'N/A'}</span> | 
+                                  θPerf: <span style={{ color: COLORS.primary }}>{retentionStats.current_retention_config.theta_performance?.toFixed(3) ?? 'N/A'}</span> | 
+                                  Base: <span style={{ color: COLORS.primary }}>{retentionStats.current_retention_config.base_continue_prob?.toFixed(3) ?? 'N/A'}</span>
+                                </div>
+                              </div>
+                            )}
+                          </>
+                        ) : (
+                          <div style={{ fontSize: '0.6rem', color: COLORS.textMuted, fontStyle: 'italic' }}>
+                            Waiting for data... (run simulation to see diagnostic info)
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                
+                <div style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: '8px', padding: '1rem', marginTop: '0.75rem' }}>
+                  <h4 style={{ fontSize: '0.75rem', color: COLORS.textMuted, marginBottom: '0.5rem' }}>EFFECTIVE POPULATION SIZE OVER TIME</h4>
+                  <ResponsiveContainer width="100%" height={250}>
+                    <LineChart data={effectivePopulationHistory}>
+                      <CartesianGrid strokeDasharray="3 3" stroke={COLORS.border} />
+                      <XAxis dataKey="tick" tick={{ fill: COLORS.textMuted, fontSize: 10 }} label={{ value: 'Time (ticks)', position: 'insideBottom', offset: -5, fill: COLORS.textMuted }} />
+                      <YAxis tick={{ fill: COLORS.textMuted, fontSize: 10 }} label={{ value: 'Concurrent Players', angle: -90, position: 'insideLeft', fill: COLORS.textMuted }} />
+                      <Tooltip contentStyle={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }} />
+                      <Line type="monotone" dataKey="population" stroke={COLORS.primary} strokeWidth={2} dot={false} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+                
+                <div style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: '8px', padding: '1rem', marginTop: '0.75rem' }}>
+                  <h4 style={{ fontSize: '0.75rem', color: COLORS.textMuted, marginBottom: '0.5rem' }}>RETURN RATE BY SKILL BUCKET</h4>
+                  <ResponsiveContainer width="100%" height={250}>
+                    <BarChart data={(() => {
+                      if (!returnStats?.per_bucket_return_rate) return [];
+                      return Object.entries(returnStats.per_bucket_return_rate).map(([bucket, rate]) => ({
+                        bucket: parseInt(bucket),
+                        rate: rate,
+                        ratePercent: (rate * 100).toFixed(1),
+                      })).sort((a, b) => a.bucket - b.bucket);
+                    })()}>
+                      <CartesianGrid strokeDasharray="3 3" stroke={COLORS.border} />
+                      <XAxis dataKey="bucket" tick={{ fill: COLORS.textMuted, fontSize: 10 }} label={{ value: 'Skill Bucket', position: 'insideBottom', offset: -5, fill: COLORS.textMuted }} />
+                      <YAxis tick={{ fill: COLORS.textMuted, fontSize: 10 }} domain={[0, 1]} tickFormatter={(v) => `${(v*100).toFixed(0)}%`} />
+                      <Tooltip contentStyle={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }} formatter={(v) => `${(v*100).toFixed(1)}%`} />
+                      <Bar dataKey="rate" fill={COLORS.quaternary} radius={[2, 2, 0, 0]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
               </div>
             </div>
           )}
@@ -1296,6 +1601,7 @@ export default function MatchmakingSimulator() {
                   </BarChart>
                 </ResponsiveContainer>
               </div>
+              
 
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem' }}>
                 <div style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: '8px', padding: '1rem' }}>

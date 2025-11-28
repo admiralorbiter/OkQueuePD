@@ -35,6 +35,19 @@ pub struct Simulation {
     arrival_rate: f64,
     /// Number of matches since last percentile update
     matches_since_percentile_update: usize,
+    /// Session tracking: total matches played across completed sessions
+    total_matches_in_sessions: usize,
+    /// Session tracking: continuation/quit counts by bucket (bucket -> (continues, quits))
+    session_continues: HashMap<usize, (usize, usize)>,
+    /// Return probability tracking: return attempts by bucket (bucket -> count)
+    return_attempts_by_bucket: HashMap<usize, usize>,
+    /// Return probability tracking: returns by bucket (bucket -> count)
+    returns_by_bucket: HashMap<usize, usize>,
+    /// Diagnostic: track computed continue probabilities (for verification)
+    continue_prob_samples: Vec<f64>,
+    /// Diagnostic: track logit values and experience vectors (for debugging)
+    logit_samples: Vec<f64>,
+    experience_samples: Vec<(f64, f64, f64, f64, f64)>, // (delta_ping, search_time, blowout_rate, win_rate, performance)
 }
 
 impl Simulation {
@@ -46,7 +59,11 @@ impl Simulation {
             searches: Vec::new(),
             matches: HashMap::new(),
             config,
-            stats: SimulationStats::default(),
+            stats: {
+                let mut stats = SimulationStats::default();
+                stats.churn_threshold_ticks = 100; // Default: 100 ticks
+                stats
+            },
             next_player_id: 0,
             next_search_id: 0,
             next_match_id: 0,
@@ -55,6 +72,13 @@ impl Simulation {
             rng_seed: seed,
             arrival_rate: 10.0,
             matches_since_percentile_update: 0,
+            total_matches_in_sessions: 0,
+            session_continues: HashMap::new(),
+            return_attempts_by_bucket: HashMap::new(),
+            returns_by_bucket: HashMap::new(),
+            continue_prob_samples: Vec::new(),
+            logit_samples: Vec::new(),
+            experience_samples: Vec::new(),
         }
     }
 
@@ -343,23 +367,61 @@ impl Simulation {
         }
     }
 
-    /// Bring players online based on arrival rate
+    /// Bring players online based on arrival rate and return probability
     pub fn process_arrivals(&mut self, rng: &mut impl Rng) {
-        let offline_players: Vec<usize> = self.players
-            .iter()
-            .filter(|(_, p)| p.state == PlayerState::Offline)
-            .map(|(&id, _)| id)
-            .collect();
+        // Collect offline players with their return probabilities
+        let mut candidates: Vec<(usize, usize, f64)> = Vec::new(); // (player_id, bucket, return_prob)
+        
+        for (&player_id, player) in &self.players {
+            if player.state == PlayerState::Offline {
+                let return_prob = self.compute_return_probability(player);
+                let bucket = player.skill_bucket;
+                candidates.push((player_id, bucket, return_prob));
+                
+                // Track return attempt by bucket
+                *self.return_attempts_by_bucket.entry(bucket).or_insert(0) += 1;
+                self.stats.total_return_attempts += 1;
+            }
+        }
 
-        // Poisson arrivals
+        // If no candidates, nothing to process
+        if candidates.is_empty() {
+            return;
+        }
+
+        // Sample arrivals using return probability (threshold-based)
+        // Each candidate has a chance to return based on their return probability
+        let mut arrivals: Vec<usize> = Vec::new();
+        for (player_id, bucket, return_prob) in candidates {
+            if rng.gen_bool(return_prob) {
+                arrivals.push(player_id);
+                
+                // Track return by bucket
+                *self.returns_by_bucket.entry(bucket).or_insert(0) += 1;
+                self.stats.total_returns += 1;
+            }
+        }
+
+        // Limit arrivals to Poisson rate (if we have too many, randomly sample)
         let num_arrivals = self.poisson_sample(self.arrival_rate, rng);
-        let arrivals: Vec<usize> = offline_players
-            .into_iter()
-            .take(num_arrivals)
-            .collect();
+        if arrivals.len() > num_arrivals {
+            // Shuffle and take first N
+            use rand::seq::SliceRandom;
+            arrivals.as_mut_slice().shuffle(rng);
+            arrivals.truncate(num_arrivals);
+        }
 
         for player_id in arrivals {
             if let Some(player) = self.players.get_mut(&player_id) {
+                // Start new session when player comes online
+                if player.state == PlayerState::Offline {
+                    player.session_start_time = Some(self.current_time);
+                    player.matches_in_session = 0;
+                    // Don't clear last_session_experience - we need it for return probability
+                    // Only clear last_session_end_time since they're now active again
+                    // (but keep experience for potential future return calculations)
+                    player.last_session_end_time = None;
+                }
                 player.state = PlayerState::InLobby;
             }
         }
@@ -727,6 +789,31 @@ impl Simulation {
                     let won = team_idx == winning_team;
                     
                     for &player_id in team {
+                        // Get immutable reference first to compute continue probability
+                        let (match_delta_ping, match_search_time, match_performance, bucket, matches_in_session) = {
+                            if let Some(player) = self.players.get(&player_id) {
+                                (
+                                    player.recent_delta_pings.last().copied().unwrap_or(0.0),
+                                    player.recent_search_times.last().copied().unwrap_or(0.0),
+                                    game_match.player_performances.get(&player_id).copied().unwrap_or(0.5),
+                                    player.skill_bucket,
+                                    player.matches_in_session,
+                                )
+                            } else {
+                                continue;
+                            }
+                        };
+                        
+                        // Build experience vector for this match
+                        let experience = ExperienceVector {
+                            avg_delta_ping: match_delta_ping,
+                            avg_search_time: match_search_time,
+                            was_blowout: is_blowout,
+                            won,
+                            performance: match_performance,
+                        };
+                        
+                        // Now get mutable reference to update player
                         if let Some(player) = self.players.get_mut(&player_id) {
                             player.matches_played += 1;
                             if won {
@@ -741,39 +828,109 @@ impl Simulation {
                             }
 
                             player.current_match = None;
-
-                            // Calculate continue probability inline to avoid borrow issues
-                            let base_prob = player.continuation_prob;
                             
-                            let avg_delta_ping = if player.recent_delta_pings.is_empty() {
-                                0.0
-                            } else {
-                                player.recent_delta_pings.iter().sum::<f64>() / player.recent_delta_pings.len() as f64
+                            // Add to recent experience (maintain window size)
+                            player.recent_experience.push(experience);
+                            let window_size = self.config.retention_config.experience_window_size;
+                            if player.recent_experience.len() > window_size {
+                                player.recent_experience.remove(0);
+                            }
+                            
+                            // Calculate continue probability using formal logistic model
+                            // Clone necessary data to avoid borrow checker issues
+                            let recent_experience_clone = player.recent_experience.clone();
+                            let continue_prob = {
+                                let config = &self.config.retention_config;
+                                if recent_experience_clone.is_empty() {
+                                    let logit = config.base_continue_prob;
+                                    let prob = 1.0 / (1.0 + (-logit).exp());
+                                    prob.clamp(0.0, 1.0)
+                                } else {
+                                    let window_size = config.experience_window_size.min(recent_experience_clone.len());
+                                    let recent = &recent_experience_clone[recent_experience_clone.len().saturating_sub(window_size)..];
+                                    
+                                    let avg_delta_ping = recent.iter().map(|e| e.avg_delta_ping).sum::<f64>() / recent.len() as f64;
+                                    let avg_search_time = recent.iter().map(|e| e.avg_search_time).sum::<f64>() / recent.len() as f64;
+                                    let blowout_rate = recent.iter().filter(|e| e.was_blowout).count() as f64 / recent.len() as f64;
+                                    let win_rate = recent.iter().filter(|e| e.won).count() as f64 / recent.len() as f64;
+                                    let avg_performance = recent.iter().map(|e| e.performance).sum::<f64>() / recent.len() as f64;
+                                    
+                                    // Debug: Log first few calculations to verify math
+                                    let ping_term = config.theta_ping * avg_delta_ping;
+                                    let search_term = config.theta_search_time * avg_search_time;
+                                    let blowout_term = config.theta_blowout * blowout_rate;
+                                    let win_term = config.theta_win_rate * win_rate;
+                                    let perf_term = config.theta_performance * avg_performance;
+                                    
+                                    let logit = config.base_continue_prob
+                                        + ping_term
+                                        + search_term
+                                        + blowout_term
+                                        + win_term
+                                        + perf_term;
+                                    
+                                    // Track diagnostic samples (keep last 100)
+                                    self.logit_samples.push(logit);
+                                    if self.logit_samples.len() > 100 {
+                                        self.logit_samples.remove(0);
+                                    }
+                                    self.experience_samples.push((avg_delta_ping, avg_search_time, blowout_rate, win_rate, avg_performance));
+                                    if self.experience_samples.len() > 100 {
+                                        self.experience_samples.remove(0);
+                                    }
+                                    
+                                    let prob = 1.0 / (1.0 + (-logit).exp());
+                                    let prob = prob.clamp(0.0, 1.0);
+                                    if prob.is_finite() { prob } else { 0.5 }
+                                }
                             };
-                            let ping_penalty = (avg_delta_ping / 100.0).min(0.2);
                             
-                            let avg_search_time = if player.recent_search_times.is_empty() {
-                                0.0
-                            } else {
-                                player.recent_search_times.iter().sum::<f64>() / player.recent_search_times.len() as f64
-                            };
-                            let search_penalty = (avg_search_time / 120.0).min(0.15);
+                            // Track continuation decision for statistics
+                            let (continues, quits) = self.session_continues.entry(bucket).or_insert((0, 0));
                             
-                            let blowout_rate = if player.recent_blowouts.is_empty() {
-                                0.0
-                            } else {
-                                player.recent_blowouts.iter().filter(|&&b| b).count() as f64 
-                                    / player.recent_blowouts.len() as f64
-                            };
-                            let blowout_penalty = blowout_rate * 0.2;
+                            // Track computed probability for diagnostics (keep last 1000 samples)
+                            self.continue_prob_samples.push(continue_prob);
+                            if self.continue_prob_samples.len() > 1000 {
+                                self.continue_prob_samples.remove(0);
+                            }
                             
-                            let continue_prob = (base_prob - ping_penalty - search_penalty - blowout_penalty).max(0.3).min(1.0);
-                            let continue_prob = if continue_prob.is_finite() { continue_prob } else { 0.5 };
-
                             if rng.gen_bool(continue_prob) {
+                                // Player continues
+                                *continues += 1;
                                 player.state = PlayerState::InLobby;
+                                player.matches_in_session += 1;
                             } else {
+                                // Player quits
+                                *quits += 1;
+                                
+                                // Track quit for leaving rate calculation
+                                self.stats.recent_quits.push((self.current_time, 1));
+                                
+                                // Preserve session experience for return probability calculation
+                                player.last_session_experience = player.recent_experience.clone();
+                                player.last_session_end_time = Some(self.current_time);
+                                
+                                // Clear current session experience (will be rebuilt in next session)
+                                player.recent_experience.clear();
+                                
                                 player.state = PlayerState::Offline;
+                                
+                                // Record session completion
+                                if matches_in_session > 0 {
+                                    let session_length = matches_in_session;
+                                    self.total_matches_in_sessions += session_length;
+                                    self.stats.total_sessions_completed += 1;
+                                    
+                                    // Record in distribution (extend if needed)
+                                    while self.stats.session_length_distribution.len() <= session_length {
+                                        self.stats.session_length_distribution.push(0);
+                                    }
+                                    self.stats.session_length_distribution[session_length] += 1;
+                                    
+                                    // Clear session tracking
+                                    player.session_start_time = None;
+                                    player.matches_in_session = 0;
+                                }
                             }
                         }
                     }
@@ -837,35 +994,141 @@ impl Simulation {
     }
 
     /// Calculate probability of player continuing based on experience
+    /// Per whitepaper §3.8: P(continue) = σ(θ^T z_i)
+    /// where z_i is the experience vector and θ are the retention coefficients
+    #[allow(dead_code)] // Keep old method name for now, will remove later
     fn calculate_continue_probability(&self, player: &Player) -> f64 {
-        let base_prob = player.continuation_prob;
+        self.compute_continue_probability(player)
+    }
+
+    /// Calculate probability of player continuing based on experience
+    /// Compute return probability based on last session's experience
+    /// Per whitepaper §3.8: P(return) = σ(θ^T z_i)
+    /// where z_i is the experience vector from last session and θ are the retention coefficients
+    fn compute_return_probability(&self, player: &Player) -> f64 {
+        let config = &self.config.retention_config;
         
-        // Penalty for high delta pings
-        let avg_delta_ping = if player.recent_delta_pings.is_empty() {
-            0.0
+        // If no last session experience, use base probability
+        // Try last_session_experience first, fall back to recent_experience if available
+        let experience_source = if !player.last_session_experience.is_empty() {
+            &player.last_session_experience
+        } else if !player.recent_experience.is_empty() {
+            // Fallback: use current session experience if last session not preserved yet
+            &player.recent_experience
         } else {
-            player.recent_delta_pings.iter().sum::<f64>() / player.recent_delta_pings.len() as f64
+            // New players or players with no experience: use base probability
+            let logit = config.base_continue_prob;
+            let prob = 1.0 / (1.0 + (-logit).exp());
+            return prob.clamp(0.0, 1.0);
         };
-        let ping_penalty = (avg_delta_ping / 100.0).min(0.2);
         
-        // Penalty for long search times
-        let avg_search_time = if player.recent_search_times.is_empty() {
-            0.0
+        // Build experience vector from last session (last N matches)
+        let window_size = config.experience_window_size.min(experience_source.len());
+        let recent = &experience_source[experience_source.len().saturating_sub(window_size)..];
+        
+        // Compute averages across recent matches
+        let avg_delta_ping = recent.iter()
+            .map(|e| e.avg_delta_ping)
+            .sum::<f64>() / recent.len() as f64;
+        
+        let avg_search_time = recent.iter()
+            .map(|e| e.avg_search_time)
+            .sum::<f64>() / recent.len() as f64;
+        
+        let blowout_rate = recent.iter()
+            .filter(|e| e.was_blowout)
+            .count() as f64 / recent.len() as f64;
+        
+        let win_rate = recent.iter()
+            .filter(|e| e.won)
+            .count() as f64 / recent.len() as f64;
+        
+        let avg_performance = recent.iter()
+            .map(|e| e.performance)
+            .sum::<f64>() / recent.len() as f64;
+        
+        // Apply logistic model: P(return) = σ(base + θ^T z)
+        // z = [avg_delta_ping, avg_search_time, blowout_rate, win_rate, avg_performance]
+        // θ = [theta_ping, theta_search_time, theta_blowout, theta_win_rate, theta_performance]
+        let logit = config.base_continue_prob
+            + config.theta_ping * avg_delta_ping
+            + config.theta_search_time * avg_search_time
+            + config.theta_blowout * blowout_rate
+            + config.theta_win_rate * win_rate
+            + config.theta_performance * avg_performance;
+        
+        // Logistic function: σ(x) = 1 / (1 + exp(-x))
+        let prob = 1.0 / (1.0 + (-logit).exp());
+        
+        // Validate and clamp
+        let prob = prob.clamp(0.0, 1.0);
+        if prob.is_finite() {
+            prob
         } else {
-            player.recent_search_times.iter().sum::<f64>() / player.recent_search_times.len() as f64
-        };
-        let search_penalty = (avg_search_time / 120.0).min(0.15);
+            // Fallback to neutral probability if calculation fails
+            0.5
+        }
+    }
+
+    /// Per whitepaper §3.8: P(continue) = σ(θ^T z_i)
+    /// where z_i is the experience vector and θ are the retention coefficients
+    fn compute_continue_probability(&self, player: &Player) -> f64 {
+        let config = &self.config.retention_config;
         
-        // Penalty for blowouts
-        let blowout_rate = if player.recent_blowouts.is_empty() {
-            0.0
+        // If no experience history, use base probability
+        if player.recent_experience.is_empty() {
+            // Convert base logit to probability using logistic function
+            let logit = config.base_continue_prob;
+            let prob = 1.0 / (1.0 + (-logit).exp());
+            return prob.clamp(0.0, 1.0);
+        }
+        
+        // Build experience vector from recent history (last N matches)
+        let window_size = config.experience_window_size.min(player.recent_experience.len());
+        let recent = &player.recent_experience[player.recent_experience.len().saturating_sub(window_size)..];
+        
+        // Compute averages across recent matches
+        let avg_delta_ping = recent.iter()
+            .map(|e| e.avg_delta_ping)
+            .sum::<f64>() / recent.len() as f64;
+        
+        let avg_search_time = recent.iter()
+            .map(|e| e.avg_search_time)
+            .sum::<f64>() / recent.len() as f64;
+        
+        let blowout_rate = recent.iter()
+            .filter(|e| e.was_blowout)
+            .count() as f64 / recent.len() as f64;
+        
+        let win_rate = recent.iter()
+            .filter(|e| e.won)
+            .count() as f64 / recent.len() as f64;
+        
+        let avg_performance = recent.iter()
+            .map(|e| e.performance)
+            .sum::<f64>() / recent.len() as f64;
+        
+        // Apply logistic model: P(continue) = σ(base + θ^T z)
+        // z = [avg_delta_ping, avg_search_time, blowout_rate, win_rate, avg_performance]
+        // θ = [theta_ping, theta_search_time, theta_blowout, theta_win_rate, theta_performance]
+        let logit = config.base_continue_prob
+            + config.theta_ping * avg_delta_ping
+            + config.theta_search_time * avg_search_time
+            + config.theta_blowout * blowout_rate
+            + config.theta_win_rate * win_rate
+            + config.theta_performance * avg_performance;
+        
+        // Logistic function: σ(x) = 1 / (1 + exp(-x))
+        let prob = 1.0 / (1.0 + (-logit).exp());
+        
+        // Validate and clamp
+        let prob = prob.clamp(0.0, 1.0);
+        if prob.is_finite() {
+            prob
         } else {
-            player.recent_blowouts.iter().filter(|&&b| b).count() as f64 
-                / player.recent_blowouts.len() as f64
-        };
-        let blowout_penalty = blowout_rate * 0.2;
-        
-        (base_prob - ping_penalty - search_penalty - blowout_penalty).max(0.3)
+            // Fallback to neutral probability if calculation fails
+            0.5
+        }
     }
 
     /// Run a single simulation tick
@@ -967,6 +1230,23 @@ impl Simulation {
         // Calculate per-bucket statistics
         self.update_bucket_stats();
         
+        // Calculate retention metrics
+        self.update_retention_stats();
+        
+        // Calculate return probability and churn metrics
+        self.update_return_stats();
+        self.update_churn_stats();
+        self.update_leaving_rate();
+        self.update_population_change_rate();
+        
+        // Track effective population size over time (sample every 10 ticks to avoid excessive memory)
+        if self.current_time % 10 == 0 {
+            let effective_population = self.stats.players_in_lobby 
+                + self.stats.players_searching 
+                + self.stats.players_in_match;
+            self.stats.effective_population_size_over_time.push((self.current_time, effective_population));
+        }
+        
         // Calculate party statistics
         self.stats.party_count = self.parties.len();
         if !self.parties.is_empty() {
@@ -975,6 +1255,177 @@ impl Simulation {
         } else {
             self.stats.avg_party_size = 0.0;
         }
+    }
+
+    /// Update return probability statistics
+    fn update_return_stats(&mut self) {
+        // Calculate per-bucket return rates
+        self.stats.per_bucket_return_rate.clear();
+        for (bucket, &attempts) in &self.return_attempts_by_bucket {
+            let returns = self.returns_by_bucket.get(bucket).copied().unwrap_or(0);
+            if attempts > 0 {
+                let rate = returns as f64 / attempts as f64;
+                self.stats.per_bucket_return_rate.insert(*bucket, rate);
+            }
+        }
+    }
+
+    /// Update players leaving rate (quits per second)
+    /// Note: This is normalized by match completion rate to avoid feedback loop
+    /// where fewer players → fewer matches → fewer continuation decisions → lower quit rate
+    fn update_leaving_rate(&mut self) {
+        // Keep only recent quits (last 100 ticks for rolling average)
+        let cutoff_tick = self.current_time.saturating_sub(100);
+        self.stats.recent_quits.retain(|(tick, _)| *tick >= cutoff_tick);
+        
+        // Calculate total quits in recent window
+        let total_quits: usize = self.stats.recent_quits.iter().map(|(_, count)| count).sum();
+        let time_window_seconds = 100.0 * self.config.tick_interval;
+        
+        // Calculate rate (quits per second)
+        // This is the raw rate - it will be lower when fewer matches complete
+        // The diagnostic "Avg Continue Prob" shows the actual quit probability per decision
+        if time_window_seconds > 0.0 {
+            self.stats.players_leaving_rate = total_quits as f64 / time_window_seconds;
+        } else {
+            self.stats.players_leaving_rate = 0.0;
+        }
+    }
+
+    /// Update population change rate (players per second)
+    /// Tracks the rate at which effective (active) population is changing
+    /// Effective population = players in lobby + searching + in match
+    fn update_population_change_rate(&mut self) {
+        // Calculate effective population (active players)
+        let effective_population = self.stats.players_in_lobby 
+            + self.stats.players_searching 
+            + self.stats.players_in_match;
+        
+        // Record current effective population
+        self.stats.population_history.push((self.current_time, effective_population));
+        
+        // Keep diagnostic samples (last 10)
+        self.stats.recent_population_samples.push(effective_population);
+        if self.stats.recent_population_samples.len() > 10 {
+            self.stats.recent_population_samples.remove(0);
+        }
+        
+        // Keep only last 200 ticks for better trend calculation
+        if self.stats.population_history.len() > 200 {
+            self.stats.population_history.remove(0);
+        }
+        
+        // Calculate rate of change (first derivative)
+        // Use simple difference for more responsive calculation
+        if self.stats.population_history.len() >= 2 {
+            // Use last 30-50 points for smoother estimate
+            let history_len = self.stats.population_history.len();
+            let window_size = history_len.min(50).max(10);
+            // Ensure we don't underflow when calculating the start index
+            let start_idx = if history_len >= window_size {
+                history_len - window_size
+            } else {
+                0
+            };
+            let recent = &self.stats.population_history[start_idx..];
+            
+            if recent.len() >= 2 {
+                // Simple approach: calculate average rate over the window
+                let first = recent[0];
+                let last = recent[recent.len() - 1];
+                let time_diff_ticks = last.0.saturating_sub(first.0);
+                
+                // Ensure we have at least 1 tick difference to avoid division by zero
+                if time_diff_ticks > 0 {
+                    let time_diff_seconds = time_diff_ticks as f64 * self.config.tick_interval;
+                    let pop_diff = last.1 as f64 - first.1 as f64;
+                    
+                    // Calculate rate: change in population / change in time (in seconds)
+                    self.stats.population_change_rate = pop_diff / time_diff_seconds;
+                } else {
+                    // If no time difference, use 0
+                    self.stats.population_change_rate = 0.0;
+                }
+            } else {
+                self.stats.population_change_rate = 0.0;
+            }
+        } else {
+            self.stats.population_change_rate = 0.0;
+        }
+    }
+
+    /// Update churn statistics
+    /// Churn rate represents the fraction of total population that is currently churned
+    /// (offline for longer than threshold and haven't returned)
+    fn update_churn_stats(&mut self) {
+        let threshold = self.stats.churn_threshold_ticks;
+        let mut churned_players = 0;
+        let total_population = self.players.len();
+        
+        for player in self.players.values() {
+            if player.state == PlayerState::Offline {
+                if let Some(last_end_time) = player.last_session_end_time {
+                    let time_since_offline = self.current_time.saturating_sub(last_end_time);
+                    if time_since_offline > threshold {
+                        // Player is churned: offline for > threshold
+                        churned_players += 1;
+                    }
+                }
+            }
+        }
+        
+        // Calculate churn rate as fraction of total population
+        // This represents how much of the population is currently churned
+        if total_population > 0 {
+            self.stats.churn_rate = churned_players as f64 / total_population as f64;
+        } else {
+            self.stats.churn_rate = 0.0;
+        }
+    }
+
+    /// Update retention and session statistics
+    fn update_retention_stats(&mut self) {
+        // Calculate per-bucket continuation rates
+        self.stats.per_bucket_continue_rate.clear();
+        for (bucket, &(continues, quits)) in &self.session_continues {
+            let total = continues + quits;
+            if total > 0 {
+                let rate = continues as f64 / total as f64;
+                self.stats.per_bucket_continue_rate.insert(*bucket, rate);
+            }
+        }
+        
+        // Calculate average matches per session
+        if self.stats.total_sessions_completed > 0 {
+            self.stats.avg_matches_per_session = self.total_matches_in_sessions as f64 
+                / self.stats.total_sessions_completed as f64;
+        } else {
+            self.stats.avg_matches_per_session = 0.0;
+        }
+        
+        // Count active sessions (players in IN_LOBBY, SEARCHING, or IN_MATCH)
+        self.stats.active_sessions = self.players.values()
+            .filter(|p| matches!(p.state, PlayerState::InLobby | PlayerState::Searching | PlayerState::InMatch))
+            .count();
+        
+        // Calculate average computed continue probability (diagnostic)
+        if !self.continue_prob_samples.is_empty() {
+            self.stats.avg_computed_continue_prob = self.continue_prob_samples.iter().sum::<f64>() 
+                / self.continue_prob_samples.len() as f64;
+        } else {
+            self.stats.avg_computed_continue_prob = 0.0;
+        }
+        
+        // Store diagnostic samples
+        if !self.logit_samples.is_empty() {
+            self.stats.sample_logits = self.logit_samples.clone();
+        }
+        if !self.experience_samples.is_empty() {
+            self.stats.sample_experiences = self.experience_samples.clone();
+        }
+        
+        // Store current retention config for verification
+        self.stats.current_retention_config = Some(self.config.retention_config.clone());
     }
 
     fn update_bucket_stats(&mut self) {
