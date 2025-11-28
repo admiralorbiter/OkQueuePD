@@ -66,6 +66,13 @@ const defaultConfig = {
   numSkillBuckets: 10,
   topKCandidates: 50,
   arrivalRate: 10,
+  useExactTeamBalancing: true,
+  gamma: 2.0,
+  blowoutSkillCoefficient: 0.4,
+  blowoutImbalanceCoefficient: 0.3,
+  blowoutMildThreshold: 0.15,
+  blowoutModerateThreshold: 0.35,
+  blowoutSevereThreshold: 0.6,
 };
 
 // ============================================================================
@@ -149,6 +156,13 @@ export default function MatchmakingSimulator() {
       tick_interval: jsConfig.tickInterval,
       num_skill_buckets: jsConfig.numSkillBuckets,
       top_k_candidates: jsConfig.topKCandidates,
+      use_exact_team_balancing: jsConfig.useExactTeamBalancing ?? true,
+      gamma: jsConfig.gamma ?? 2.0,
+      blowout_skill_coefficient: jsConfig.blowoutSkillCoefficient ?? 0.4,
+      blowout_imbalance_coefficient: jsConfig.blowoutImbalanceCoefficient ?? 0.3,
+      blowout_mild_threshold: jsConfig.blowoutMildThreshold ?? 0.15,
+      blowout_moderate_threshold: jsConfig.blowoutModerateThreshold ?? 0.35,
+      blowout_severe_threshold: jsConfig.blowoutSevereThreshold ?? 0.6,
     };
   }, []);
 
@@ -202,6 +216,10 @@ export default function MatchmakingSimulator() {
         soloMatchCount: rawStats.solo_match_count || 0,
         partySearchTimes: rawStats.party_search_times || [],
         soloSearchTimes: rawStats.solo_search_times || [],
+        // Slice C: Blowout and team balancing metrics
+        blowoutSeverityCounts: rawStats.blowout_severity_counts || {},
+        perPlaylistBlowoutRate: rawStats.per_playlist_blowout_rate || {},
+        teamSkillDifferenceSamples: rawStats.team_skill_difference_samples || [],
         // Time series data
         timeSeriesData: [],
       };
@@ -270,6 +288,10 @@ export default function MatchmakingSimulator() {
               soloMatchCount: rawStats.solo_match_count || 0,
               partySearchTimes: rawStats.party_search_times || [],
               soloSearchTimes: rawStats.solo_search_times || [],
+              // Slice C: Blowout and team balancing metrics
+              blowoutSeverityCounts: rawStats.blowout_severity_counts || {},
+              perPlaylistBlowoutRate: rawStats.per_playlist_blowout_rate || {},
+              teamSkillDifferenceSamples: rawStats.team_skill_difference_samples || [],
               // Time series data (preserve from previous or initialize)
               timeSeriesData: prevStats?.timeSeriesData || [],
             };
@@ -598,21 +620,58 @@ export default function MatchmakingSimulator() {
               ['arrivalRate', 'Arrival Rate (auto-scaled)', 1, 2000],
             ].map(([key, label, min, max]) => (
               <label key={key} style={{ display: 'block', marginBottom: '0.5rem' }}>
-              <span style={{ fontSize: '0.65rem', color: COLORS.textMuted }}>
-                {label}: {config[key].toFixed(2)}
-                {key === 'partyPlayerFraction' && ' (0 = all solo, 1 = all in parties)'}
-              </span>
+                <span style={{ fontSize: '0.65rem', color: COLORS.textMuted }}>
+                  {label}: {config[key].toFixed(2)}
+                  {key === 'partyPlayerFraction' && ' (0 = all solo, 1 = all in parties)'}
+                </span>
                 <input
                   type="range"
                   min={min}
                   max={max}
                   step={(max - min) / 100}
                   value={config[key]}
-                  onChange={(e) => updateConfig(key, e.target.value)}
+                  onChange={(e) => updateConfig(key, parseFloat(e.target.value))}
                   style={{ width: '100%', accentColor: COLORS.tertiary }}
                 />
               </label>
             ))}
+            <div style={{ marginTop: '1rem', paddingTop: '1rem', borderTop: `1px solid ${COLORS.border}` }}>
+              <h4 style={{ fontSize: '0.65rem', color: COLORS.textMuted, marginBottom: '0.5rem' }}>TEAM BALANCING & BLOWOUTS</h4>
+              <label style={{ display: 'block', marginBottom: '0.5rem' }}>
+                <span style={{ fontSize: '0.65rem', color: COLORS.textMuted }}>
+                  <input
+                    type="checkbox"
+                    checked={config.useExactTeamBalancing}
+                    onChange={(e) => updateConfig('useExactTeamBalancing', e.target.checked)}
+                    style={{ marginRight: '0.5rem', accentColor: COLORS.tertiary }}
+                  />
+                  Use Exact Team Balancing (6v6)
+                </span>
+              </label>
+              {[
+                ['gamma', 'Win Probability Gamma', 0.5, 5.0],
+                ['blowoutSkillCoefficient', 'Blowout Skill Coeff', 0.0, 1.0],
+                ['blowoutImbalanceCoefficient', 'Blowout Imbalance Coeff', 0.0, 1.0],
+                ['blowoutMildThreshold', 'Blowout Mild Threshold', 0.0, 1.0],
+                ['blowoutModerateThreshold', 'Blowout Moderate Threshold', 0.0, 1.0],
+                ['blowoutSevereThreshold', 'Blowout Severe Threshold', 0.0, 1.0],
+              ].map(([key, label, min, max]) => (
+                <label key={key} style={{ display: 'block', marginBottom: '0.5rem' }}>
+                  <span style={{ fontSize: '0.65rem', color: COLORS.textMuted }}>
+                    {label}: {config[key]?.toFixed(2) ?? '0.00'}
+                  </span>
+                  <input
+                    type="range"
+                    min={min}
+                    max={max}
+                    step={(max - min) / 100}
+                    value={config[key] ?? (min + max) / 2}
+                    onChange={(e) => updateConfig(key, parseFloat(e.target.value))}
+                    style={{ width: '100%', accentColor: COLORS.tertiary }}
+                  />
+                </label>
+              ))}
+            </div>
           </div>
 
           <div>
@@ -1001,6 +1060,80 @@ export default function MatchmakingSimulator() {
                     </Bar>
                   </BarChart>
                 </ResponsiveContainer>
+              </div>
+
+              {/* New Slice C Charts */}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem', marginTop: '0.75rem' }}>
+                <div style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: '8px', padding: '1rem' }}>
+                  <h4 style={{ fontSize: '0.75rem', color: COLORS.textMuted, marginBottom: '0.5rem' }}>BLOWOUT RATE BY PLAYLIST</h4>
+                  <ResponsiveContainer width="100%" height={250}>
+                    <BarChart data={(() => {
+                      if (!stats.perPlaylistBlowoutRate) return [];
+                      return Object.entries(stats.perPlaylistBlowoutRate).map(([playlist, rate]) => ({
+                        playlist: playlist.replace(/([A-Z])/g, ' $1').trim(),
+                        rate: rate * 100,
+                      }));
+                    })()}>
+                      <CartesianGrid strokeDasharray="3 3" stroke={COLORS.border} />
+                      <XAxis dataKey="playlist" tick={{ fill: COLORS.textMuted, fontSize: 9 }} angle={-45} textAnchor="end" height={60} />
+                      <YAxis tick={{ fill: COLORS.textMuted, fontSize: 10 }} label={{ value: 'Blowout Rate (%)', angle: -90, position: 'insideLeft', fill: COLORS.textMuted }} />
+                      <Tooltip contentStyle={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }} formatter={(v) => `${Number(v).toFixed(1)}%`} />
+                      <Bar dataKey="rate" fill={COLORS.danger} radius={[2, 2, 0, 0]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+
+                <div style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: '8px', padding: '1rem' }}>
+                  <h4 style={{ fontSize: '0.75rem', color: COLORS.textMuted, marginBottom: '0.5rem' }}>BLOWOUT SEVERITY DISTRIBUTION</h4>
+                  <ResponsiveContainer width="100%" height={250}>
+                    <BarChart data={(() => {
+                      if (!stats.blowoutSeverityCounts) return [];
+                      const severityMap = { 'Mild': 0, 'Moderate': 0, 'Severe': 0 };
+                      Object.entries(stats.blowoutSeverityCounts).forEach(([severity, count]) => {
+                        severityMap[severity] = count;
+                      });
+                      return Object.entries(severityMap).map(([severity, count]) => ({ severity, count }));
+                    })()}>
+                      <CartesianGrid strokeDasharray="3 3" stroke={COLORS.border} />
+                      <XAxis dataKey="severity" tick={{ fill: COLORS.textMuted, fontSize: 10 }} />
+                      <YAxis tick={{ fill: COLORS.textMuted, fontSize: 10 }} />
+                      <Tooltip contentStyle={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }} />
+                      <Bar dataKey="count" radius={[2, 2, 0, 0]}>
+                        {[COLORS.warning, COLORS.quaternary, COLORS.danger].map((color, i) => (
+                          <Cell key={i} fill={color} />
+                        ))}
+                      </Bar>
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+
+                <div style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: '8px', padding: '1rem' }}>
+                  <h4 style={{ fontSize: '0.75rem', color: COLORS.textMuted, marginBottom: '0.5rem' }}>TEAM SKILL DIFFERENCE DISTRIBUTION</h4>
+                  <ResponsiveContainer width="100%" height={250}>
+                    <BarChart data={(() => {
+                      if (!stats.teamSkillDifferenceSamples || stats.teamSkillDifferenceSamples.length === 0) return [];
+                      const samples = stats.teamSkillDifferenceSamples;
+                      const max = Math.max(...samples);
+                      const bins = 20;
+                      const binWidth = max / bins;
+                      const histogram = Array(bins).fill(0).map((_, i) => ({
+                        range: `${(i * binWidth).toFixed(2)}-${((i + 1) * binWidth).toFixed(2)}`,
+                        count: 0,
+                      }));
+                      samples.forEach(sample => {
+                        const bin = Math.min(Math.floor(sample / binWidth), bins - 1);
+                        histogram[bin].count += 1;
+                      });
+                      return histogram;
+                    })()}>
+                      <CartesianGrid strokeDasharray="3 3" stroke={COLORS.border} />
+                      <XAxis dataKey="range" tick={{ fill: COLORS.textMuted, fontSize: 8 }} angle={-45} textAnchor="end" height={60} />
+                      <YAxis tick={{ fill: COLORS.textMuted, fontSize: 10 }} />
+                      <Tooltip contentStyle={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }} />
+                      <Bar dataKey="count" fill={COLORS.primary} radius={[2, 2, 0, 0]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
               </div>
               </div>
             </div>

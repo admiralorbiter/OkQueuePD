@@ -423,6 +423,41 @@ impl Simulation {
                 })
                 .collect();
 
+            // Calculate team skill difference and win probability
+            let team_skill_diff = if team_skills.len() >= 2 {
+                team_skills[0] - team_skills[1]
+            } else {
+                0.0
+            };
+            
+            // Track team skill difference for statistics
+            self.stats.team_skill_difference_samples.push(team_skill_diff.abs());
+
+            // Calculate win probability using configurable logistic
+            let win_prob_team0 = if team_skills.len() >= 2 {
+                let gamma = self.config.gamma;
+                let logistic = 1.0 / (1.0 + (-gamma * team_skill_diff).exp());
+                logistic.clamp(0.0, 1.0)
+            } else {
+                0.5
+            };
+            
+            // Ensure probability is valid
+            let win_prob_team0 = if win_prob_team0.is_finite() { win_prob_team0 } else { 0.5 };
+            
+            // Calculate win probability imbalance (0-1 scale)
+            let win_probability_imbalance = (win_prob_team0 - 0.5).abs() * 2.0;
+            
+            // Calculate expected score differential
+            // For team-based modes, scale by typical score range (e.g., 0-100 for TDM)
+            let expected_score_differential = match result.playlist {
+                Playlist::TeamDeathmatch => team_skill_diff * 30.0, // Rough scaling
+                Playlist::SearchAndDestroy => team_skill_diff * 6.0,  // Rounds won
+                Playlist::Domination => team_skill_diff * 200.0,     // Points
+                Playlist::GroundWar => team_skill_diff * 100.0,      // Points
+                Playlist::FreeForAll => team_skill_diff * 20.0,      // Kills
+            };
+
             // Calculate match duration with some variance
             let base_duration = result.playlist.avg_match_duration_seconds();
             let duration_variance = rng.gen_range(0.8..1.2);
@@ -439,6 +474,9 @@ impl Simulation {
                 quality_score: result.quality_score,
                 skill_disparity: result.skill_disparity,
                 avg_delta_ping: result.avg_delta_ping,
+                expected_score_differential,
+                win_probability_imbalance,
+                blowout_severity: None, // Will be assigned in determine_outcome()
             };
 
             // Check if match involves parties
@@ -507,7 +545,7 @@ impl Simulation {
             .collect();
 
         for match_id in completed_matches {
-            if let Some(game_match) = self.matches.remove(&match_id) {
+            if let Some(mut game_match) = self.matches.remove(&match_id) {
                 // Release server
                 if let Some(dc) = self.data_centers.iter_mut().find(|dc| dc.id == game_match.data_center_id) {
                     if let Some(busy) = dc.busy_servers.get_mut(&game_match.playlist) {
@@ -515,11 +553,21 @@ impl Simulation {
                     }
                 }
 
+                // Track per-playlist match count
+                *self.stats.per_playlist_match_counts.entry(game_match.playlist).or_insert(0) += 1;
+
                 // Determine match outcome
-                let (winning_team, is_blowout) = self.determine_outcome(&game_match, rng);
+                let (winning_team, is_blowout, blowout_severity) = self.determine_outcome(&mut game_match, rng);
                 
                 if is_blowout {
                     self.stats.blowout_count += 1;
+                    // Track per-playlist blowout count
+                    *self.stats.per_playlist_blowout_counts.entry(game_match.playlist).or_insert(0) += 1;
+                }
+                
+                // Track blowout severity
+                if let Some(severity) = blowout_severity {
+                    *self.stats.blowout_severity_counts.entry(severity).or_insert(0) += 1;
                 }
 
                 // Update player stats and decide if they continue
@@ -583,15 +631,17 @@ impl Simulation {
     }
 
     /// Determine match outcome using skill difference
-    fn determine_outcome(&self, game_match: &Match, rng: &mut impl Rng) -> (usize, bool) {
+    /// Returns (winning_team, is_blowout, blowout_severity)
+    fn determine_outcome(&self, game_match: &mut Match, rng: &mut impl Rng) -> (usize, bool, Option<BlowoutSeverity>) {
         if game_match.team_skills.len() < 2 {
-            return (0, false);
+            return (0, false, None);
         }
 
         let skill_diff = game_match.team_skills[0] - game_match.team_skills[1];
+        let skill_diff_abs = skill_diff.abs();
         
-        // Win probability based on skill difference (logistic)
-        let gamma = 2.0;
+        // Use configurable gamma for win probability calculation
+        let gamma = self.config.gamma;
         let p_team0_wins = (1.0 / (1.0 + (-gamma * skill_diff).exp())).clamp(0.0, 1.0);
         
         // Ensure probability is valid (not NaN or infinite)
@@ -599,35 +649,15 @@ impl Simulation {
         
         let winning_team = if rng.gen_bool(p_team0_wins) { 0 } else { 1 };
         
-        // Blowout detection: consider both skill difference and win probability
-        // With balanced teams, skill differences are typically small (< 0.2)
-        // So we use a lower threshold and scale probability appropriately
-        let skill_diff_abs = skill_diff.abs();
+        // Use win_probability_imbalance already calculated in match (or recalculate if needed)
+        let win_prob_imbalance = game_match.win_probability_imbalance;
         
-        // Blowout probability based on:
-        // 1. Skill difference (even small differences can lead to blowouts)
-        // 2. Win probability imbalance (one-sided matches are more likely blowouts)
-        let win_prob_imbalance = (p_team0_wins - 0.5).abs() * 2.0; // 0 to 1 scale
+        // Normalize skill difference to 0-1 scale (assuming max skill diff of ~2.0)
+        let normalized_skill_diff = (skill_diff_abs / 2.0).min(1.0);
         
-        // Base blowout probability increases with skill difference and win probability imbalance
-        // Lower threshold (0.1 instead of 0.3) to catch more cases with balanced teams
-        let blowout_prob = if skill_diff_abs > 0.1 {
-            // Scale from 0.1 to 0.5 skill diff maps to 0.1 to 0.7 blowout probability
-            let skill_component = ((skill_diff_abs - 0.1) / 0.4).min(1.0) * 0.4;
-            let imbalance_component = win_prob_imbalance * 0.3;
-            (0.1 + skill_component + imbalance_component).min(0.9)
-        } else if win_prob_imbalance > 0.4 {
-            // Even with small skill diff, high win probability imbalance suggests blowout risk
-            win_prob_imbalance * 0.5
-        } else {
-            // Small skill diff and balanced win probability - still possible but less likely
-            // Add some randomness for variance in performance
-            if skill_diff_abs > 0.05 {
-                0.05 + win_prob_imbalance * 0.1
-            } else {
-                0.02
-            }
-        };
+        // Blowout probability using configurable coefficients
+        let blowout_prob = self.config.blowout_skill_coefficient * normalized_skill_diff
+            + self.config.blowout_imbalance_coefficient * win_prob_imbalance;
         
         // Ensure blowout probability is valid
         let blowout_prob = blowout_prob.clamp(0.0, 1.0);
@@ -635,7 +665,23 @@ impl Simulation {
         
         let is_blowout = rng.gen_bool(blowout_prob);
         
-        (winning_team, is_blowout)
+        // Assign blowout severity based on thresholds
+        let blowout_severity = if !is_blowout {
+            None
+        } else if blowout_prob < self.config.blowout_mild_threshold {
+            None // Too mild to classify
+        } else if blowout_prob < self.config.blowout_moderate_threshold {
+            Some(BlowoutSeverity::Mild)
+        } else if blowout_prob < self.config.blowout_severe_threshold {
+            Some(BlowoutSeverity::Moderate)
+        } else {
+            Some(BlowoutSeverity::Severe)
+        };
+        
+        // Store severity in match
+        game_match.blowout_severity = blowout_severity;
+        
+        (winning_team, is_blowout, blowout_severity)
     }
 
     /// Calculate probability of player continuing based on experience
@@ -753,6 +799,16 @@ impl Simulation {
         // Blowout rate
         if self.stats.total_matches > 0 {
             self.stats.blowout_rate = self.stats.blowout_count as f64 / self.stats.total_matches as f64;
+        }
+        
+        // Calculate per-playlist blowout rates
+        self.stats.per_playlist_blowout_rate.clear();
+        for (playlist, &match_count) in &self.stats.per_playlist_match_counts {
+            if match_count > 0 {
+                let blowout_count = self.stats.per_playlist_blowout_counts.get(playlist).copied().unwrap_or(0);
+                let rate = blowout_count as f64 / match_count as f64;
+                self.stats.per_playlist_blowout_rate.insert(*playlist, rate);
+            }
         }
         
         // Calculate per-bucket statistics

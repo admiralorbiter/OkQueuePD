@@ -485,6 +485,14 @@ impl SearchObject {
     }
 }
 
+/// Blowout severity classification
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BlowoutSeverity {
+    Mild,      // Minor skill imbalance
+    Moderate,  // Noticeable skill difference
+    Severe,    // Significant skill gap
+}
+
 /// An active match
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Match {
@@ -505,6 +513,12 @@ pub struct Match {
     pub skill_disparity: f64,
     /// Average delta ping
     pub avg_delta_ping: f64,
+    /// Expected score differential based on skill
+    pub expected_score_differential: f64,
+    /// Win probability imbalance (0-1 scale, how one-sided the match is)
+    pub win_probability_imbalance: f64,
+    /// Blowout severity classification if blowout occurs
+    pub blowout_severity: Option<BlowoutSeverity>,
 }
 
 /// Matchmaking configuration parameters
@@ -551,6 +565,21 @@ pub struct MatchmakingConfig {
     
     /// Top K candidates to consider per seed
     pub top_k_candidates: usize,
+    
+    /// Enable expensive exact balancing for small modes (6v6)
+    pub use_exact_team_balancing: bool,
+    /// Logistic coefficient for win probability calculation
+    pub gamma: f64,
+    /// Weight for skill difference in blowout detection
+    pub blowout_skill_coefficient: f64,
+    /// Weight for win-probability imbalance in blowout detection
+    pub blowout_imbalance_coefficient: f64,
+    /// Threshold for mild blowouts
+    pub blowout_mild_threshold: f64,
+    /// Threshold for moderate blowouts
+    pub blowout_moderate_threshold: f64,
+    /// Threshold for severe blowouts
+    pub blowout_severe_threshold: f64,
 }
 
 impl Default for MatchmakingConfig {
@@ -579,6 +608,13 @@ impl Default for MatchmakingConfig {
             tick_interval: 5.0,
             num_skill_buckets: 10,
             top_k_candidates: 50,
+            use_exact_team_balancing: true,
+            gamma: 2.0,
+            blowout_skill_coefficient: 0.4,
+            blowout_imbalance_coefficient: 0.3,
+            blowout_mild_threshold: 0.15,
+            blowout_moderate_threshold: 0.35,
+            blowout_severe_threshold: 0.6,
         }
     }
 }
@@ -645,6 +681,16 @@ pub struct SimulationStats {
     /// Blowout rate (games with >2x score differential)
     pub blowout_rate: f64,
     pub blowout_count: usize,
+    /// Blowout severity counts
+    pub blowout_severity_counts: HashMap<BlowoutSeverity, usize>,
+    /// Blowout rate per playlist
+    pub per_playlist_blowout_rate: HashMap<Playlist, f64>,
+    /// Per-playlist blowout counts (for calculating rates)
+    pub per_playlist_blowout_counts: HashMap<Playlist, usize>,
+    /// Per-playlist match counts (for calculating rates)
+    pub per_playlist_match_counts: HashMap<Playlist, usize>,
+    /// Team skill difference samples (distribution)
+    pub team_skill_difference_samples: Vec<f64>,
     
     /// Per skill bucket statistics
     pub bucket_stats: HashMap<usize, BucketStats>,

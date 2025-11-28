@@ -424,7 +424,7 @@ impl Matchmaker {
         players: &HashMap<usize, Player>,
         parties: &HashMap<usize, Party>,
         playlist: Playlist,
-        rng: &mut impl Rng,
+        _rng: &mut impl Rng,
     ) -> Vec<Vec<usize>> {
         let team_count = playlist.team_count();
         
@@ -441,7 +441,7 @@ impl Matchmaker {
         }
 
         // Compute party aggregates and create party entries for balancing
-        let mut party_entries: Vec<(Option<usize>, Vec<usize>, f64)> = Vec::new();
+        let mut party_entries: Vec<(Option<usize>, Vec<usize>, f64, usize)> = Vec::new();
         for (party_id, member_ids) in party_groups {
             let avg_skill = if let Some(pid) = party_id {
                 // Get avg_skill from party
@@ -459,18 +459,29 @@ impl Matchmaker {
                     .and_then(|id| players.get(id).map(|p| p.skill))
                     .unwrap_or(0.0)
             };
-            party_entries.push((party_id, member_ids, avg_skill));
+            let party_size = member_ids.len();
+            party_entries.push((party_id, member_ids, avg_skill, party_size));
         }
 
-        // Sort parties by avg_skill (descending)
+        // For small playlists (6v6) with exact balancing enabled, use exact partitioning
+        let required_players = playlist.required_players();
+        let is_small_playlist = required_players <= 12 && team_count == 2;
+        
+        if is_small_playlist && self.config.use_exact_team_balancing {
+            if let Some(best_teams) = self.exact_partition_teams(&party_entries, required_players) {
+                return best_teams;
+            }
+            // Fall through to snake draft if exact partitioning fails
+        }
+
+        // Snake draft: assign entire parties to teams (fallback for large playlists or if exact fails)
         party_entries.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
 
-        // Snake draft: assign entire parties to teams
         let mut teams: Vec<Vec<usize>> = vec![Vec::new(); team_count];
         let mut forward = true;
         let mut team_idx = 0;
 
-        for (_, member_ids, _) in party_entries {
+        for (_, member_ids, _, _) in party_entries {
             // Assign all members of this party to the same team
             for &player_id in &member_ids {
                 teams[team_idx].push(player_id);
@@ -492,10 +503,145 @@ impl Matchmaker {
             }
         }
 
-        // Verify team sizes are balanced (allow small differences due to party sizes)
-        // No randomization needed since party integrity is maintained
-
         teams
+    }
+
+    /// Exact partitioning algorithm for small playlists (6v6)
+    /// Finds partition minimizing |sum(skills_team1) - sum(skills_team2)| while respecting party boundaries
+    fn exact_partition_teams(
+        &self,
+        party_entries: &[(Option<usize>, Vec<usize>, f64, usize)],
+        required_players: usize,
+    ) -> Option<Vec<Vec<usize>>> {
+        let target_team_size = required_players / 2;
+        
+        // Calculate total size
+        let total_size: usize = party_entries.iter().map(|(_, _, _, size)| *size).sum();
+        
+        if total_size != required_players {
+            return None; // Invalid input
+        }
+
+        // Use branch-and-bound to find best partition
+        let mut best_diff = f64::MAX;
+        let mut best_partition: Option<Vec<Vec<usize>>> = None;
+        
+        // Recursive backtracking with early termination
+        let mut team1_indices = Vec::new();
+        let mut team1_size = 0;
+        let mut team1_skill = 0.0;
+        
+        self.exact_partition_recursive(
+            party_entries,
+            target_team_size,
+            0,
+            &mut team1_indices,
+            &mut team1_size,
+            &mut team1_skill,
+            &mut best_diff,
+            &mut best_partition,
+            0,
+        );
+
+        best_partition
+    }
+
+    /// Recursive helper for exact partitioning
+    fn exact_partition_recursive(
+        &self,
+        party_entries: &[(Option<usize>, Vec<usize>, f64, usize)],
+        target_team_size: usize,
+        idx: usize,
+        team1_indices: &mut Vec<usize>,
+        team1_size: &mut usize,
+        team1_skill: &mut f64,
+        best_diff: &mut f64,
+        best_partition: &mut Option<Vec<Vec<usize>>>,
+        depth: usize,
+    ) {
+        // Timeout after reasonable depth (prevent infinite loops)
+        if depth > 1000 {
+            return;
+        }
+
+        // Base case: all parties assigned
+        if idx >= party_entries.len() {
+            if *team1_size == target_team_size {
+                let team2_skill: f64 = party_entries.iter()
+                    .enumerate()
+                    .filter(|(i, _)| !team1_indices.contains(i))
+                    .map(|(_, (_, _, skill, size))| skill * *size as f64)
+                    .sum();
+                
+                let diff = (*team1_skill - team2_skill).abs();
+                if diff < *best_diff {
+                    *best_diff = diff;
+                    
+                    // Build the actual team assignment
+                    let mut teams = vec![Vec::new(), Vec::new()];
+                    for (i, (_, member_ids, _, _)) in party_entries.iter().enumerate() {
+                        if team1_indices.contains(&i) {
+                            teams[0].extend_from_slice(member_ids);
+                        } else {
+                            teams[1].extend_from_slice(member_ids);
+                        }
+                    }
+                    *best_partition = Some(teams);
+                }
+            }
+            return;
+        }
+
+        let (_, _, skill, size) = &party_entries[idx];
+
+        // Try adding this party to team 1
+        if *team1_size + size <= target_team_size {
+            team1_indices.push(idx);
+            *team1_size += size;
+            *team1_skill += skill * *size as f64;
+            
+            // Early termination: if current diff is already worse than best, skip
+            let remaining_skill: f64 = party_entries.iter()
+                .enumerate()
+                .filter(|(i, _)| *i > idx && !team1_indices.contains(i))
+                .map(|(_, (_, _, s, sz))| s * *sz as f64)
+                .sum();
+            let current_diff = (*team1_skill - remaining_skill).abs();
+            
+            if current_diff < *best_diff {
+                self.exact_partition_recursive(
+                    party_entries,
+                    target_team_size,
+                    idx + 1,
+                    team1_indices,
+                    team1_size,
+                    team1_skill,
+                    best_diff,
+                    best_partition,
+                    depth + 1,
+                );
+            }
+            
+            // Backtrack
+            team1_indices.pop();
+            *team1_size -= size;
+            *team1_skill -= skill * *size as f64;
+        }
+
+        // Try adding this party to team 2 (skip if team1 is already full)
+        if *team1_size < target_team_size {
+            self.exact_partition_recursive(
+                party_entries,
+                target_team_size,
+                idx + 1,
+                team1_indices,
+                team1_size,
+                team1_skill,
+                best_diff,
+                best_partition,
+                depth + 1,
+            );
+        }
     }
 }
 

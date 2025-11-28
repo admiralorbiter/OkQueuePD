@@ -19,8 +19,15 @@ This roadmap guides the implementation of a full agent-based matchmaking simulat
   - Fixed skill range check to match whitepaper §3.3 exactly
   - Added optional debug logging behind feature flag
   - All backoff formulas verified correct
+- ✅ **Slice C: Team Balancing & Blowout Modeling**
+  - Exact team balancing for small playlists (6v6) using Karmarkar-Karp partitioning
+  - Enhanced blowout detection with severity classification (Mild, Moderate, Severe)
+  - Configurable win probability logistic with gamma parameter
+  - Per-playlist blowout rate tracking
+  - Team skill difference distribution tracking
+  - Frontend charts for blowout metrics and severity distribution
 
-**Remaining Slices**: C, D, E, F, G, H (optional)
+**Remaining Slices**: D, E, F, G, H (optional)
 
 ### Relationship to Whitepaper
 
@@ -42,10 +49,11 @@ The Rust/WASM engine (`src/`) already implements:
 - ✅ Search objects and seed+greedy matchmaking
 - ✅ Feasibility constraints (playlist, size, skill similarity/disparity, DC intersection, server capacity)
 - ✅ Quality scoring (ping, skill balance, wait time)
-- ✅ Team balancing (snake draft)
-- ✅ Match outcomes and blowout detection
+- ✅ Team balancing (exact partitioning for 6v6, snake draft for large playlists)
+- ✅ Match outcomes with configurable logistic and blowout severity classification
 - ✅ Basic retention/continuation logic
 - ✅ Per-bucket statistics
+- ✅ Blowout severity tracking and per-playlist metrics
 
 The React frontend (`web/src/`) provides:
 - ✅ Real-time visualization (charts, histograms, bucket stats)
@@ -53,6 +61,8 @@ The React frontend (`web/src/`) provides:
 - ✅ Configuration controls
 - ✅ Full WASM integration (Rust simulation engine running in browser)
 - ✅ Party metrics and visualizations
+- ✅ Blowout rate by playlist and severity distribution charts
+- ✅ Team balancing configuration controls
 
 ---
 
@@ -68,8 +78,8 @@ The React frontend (`web/src/`) provides:
 | **Distance Metric** | §3.1 | `calculate_distance()` with weights | ✅ Complete |
 | **Feasibility Checks** | §3.3 | `check_feasibility()` implements 6 constraints | ✅ Complete (units fixed, skill range check corrected) |
 | **Quality Score** | §3.4 | `calculate_quality()` with 3 components | ✅ Complete |
-| **Team Balancing** | §3.6 | `balance_teams()` snake draft | ⚠️ Heuristic (not Karmarkar-Karp) |
-| **Match Outcomes** | §3.7 | `determine_outcome()` logistic function | ⚠️ No performance model/KPM |
+| **Team Balancing** | §3.6 | `balance_teams()` with exact partitioning for 6v6 | ✅ Complete (exact for small, snake draft for large) |
+| **Match Outcomes** | §3.7 | `determine_outcome()` with configurable logistic and blowout severity | ⚠️ No performance model/KPM |
 | **Skill Evolution** | §3.7 | None | ❌ Missing |
 | **Retention Model** | §3.8 | Inline continuation probability | ⚠️ Ad-hoc (not formal logistic) |
 | **Parties** | §2.4, §2.7 | `Party` struct with full integration | ✅ Complete |
@@ -192,41 +202,55 @@ Each vertical slice is a self-contained feature that touches engine, metrics, an
 
 ---
 
-### Slice C: Team Balancing & Blowout Modeling
+### Slice C: Team Balancing & Blowout Modeling ✅ **COMPLETE**
 
 **Whitepaper References**: §3.6 (team balancing), §3.7 (outcomes, blowouts)
 
+**Status**: ✅ **Completed**
+
 **Goals**:
-- Improve team balancing to better approximate Karmarkar-Karp partitioning
-- Enhance blowout detection with more nuanced metrics
-- Track blowout severity/severity buckets
+- ✅ Improve team balancing to better approximate Karmarkar-Karp partitioning
+- ✅ Enhance blowout detection with more nuanced metrics
+- ✅ Track blowout severity/severity buckets
 
 **Engine Work**:
-- **`src/types.rs`**:
-  - Add to `Match`: `expected_score_differential: f64`, `win_probability_imbalance: f64`, `blowout_severity: Option<BlowoutSeverity>`
-  - Add enum `BlowoutSeverity { Mild, Moderate, Severe }`
-- **`src/matchmaker.rs`**:
-  - Refactor `balance_teams()`:
-    - For small playlists (6v6): implement exact or near-exact partition search (minimize team skill difference)
-    - Keep snake draft as fallback for large playlists
-    - Ensure parties stay intact
-  - Add config: `use_exact_team_balancing: bool` (enable expensive balancing for small modes)
-- **`src/simulation.rs`**:
-  - Enhance `determine_outcome()`:
-    - Use clearly parameterized logistic: \(P(A \text{ wins}) = \sigma(\gamma (S_A - S_B))\) with configurable \(\gamma\)
-    - Compute `win_probability_imbalance` and `expected_score_differential`
-    - Refactor blowout detection: use separate configurable coefficients for skill difference vs win-probability imbalance
-    - Assign `blowout_severity` based on thresholds
-  - Add to `SimulationStats`: `blowout_severity_counts: HashMap<BlowoutSeverity, usize>`, `per_playlist_blowout_rate: HashMap<Playlist, f64>`
+- ✅ **`src/types.rs`**:
+  - Added `BlowoutSeverity` enum: `{ Mild, Moderate, Severe }`
+  - Extended `Match`: `expected_score_differential: f64`, `win_probability_imbalance: f64`, `blowout_severity: Option<BlowoutSeverity>`
+  - Extended `MatchmakingConfig`: `use_exact_team_balancing: bool`, `gamma: f64`, blowout detection coefficients and thresholds
+  - Extended `SimulationStats`: `blowout_severity_counts`, `per_playlist_blowout_rate`, `team_skill_difference_samples`, per-playlist tracking fields
+- ✅ **`src/matchmaker.rs`**:
+  - Refactored `balance_teams()`:
+    - Implemented exact partitioning for small playlists (6v6) using recursive backtracking
+    - Minimizes `|sum(skills_team1) - sum(skills_team2)|` while respecting party boundaries
+    - Falls back to snake draft for large playlists or if exact partitioning fails
+    - Always ensures parties stay intact (no splitting)
+  - Added `exact_partition_teams()` and `exact_partition_recursive()` helper methods
+- ✅ **`src/simulation.rs`**:
+  - Enhanced `determine_outcome()`:
+    - Uses configurable logistic: \(P(A \text{ wins}) = \sigma(\gamma (S_A - S_B))\) with configurable \(\gamma\)
+    - Computes `win_probability_imbalance` and `expected_score_differential`
+    - Refactored blowout detection using configurable coefficients for skill difference vs win-probability imbalance
+    - Assigns `blowout_severity` based on configurable thresholds
+  - Updated `create_matches()` to calculate and store new match fields
+  - Updated `process_match_completions()` to track blowout severity and per-playlist stats
+  - Updated `update_stats()` to calculate per-playlist blowout rates
 
 **Frontend Work**:
-- Add chart: blowout rate by playlist
-- Add chart: blowout severity distribution
-- Show team skill difference in match details (optional)
+- ✅ Added config sliders:
+  - `useExactTeamBalancing` (checkbox)
+  - `gamma` (0.5-5.0)
+  - Blowout coefficients and thresholds (6 sliders)
+- ✅ Added charts:
+  - Blowout Rate by Playlist (bar chart)
+  - Blowout Severity Distribution (bar chart with color coding)
+  - Team Skill Difference Distribution (histogram)
+- ✅ Updated `defaultConfig` and `convertConfigToRust()` with new fields
+- ✅ Updated stats parsing to include new metrics
 
 **Metrics & Experiments**:
-- Track: team skill difference distribution, blowout rate by playlist, blowout severity breakdown
-- Experiment: Compare blowout rates with exact vs heuristic team balancing
+- ✅ Track: team skill difference distribution, blowout rate by playlist, blowout severity breakdown
+- ✅ Experiment ready: Compare blowout rates with exact vs heuristic team balancing
 
 **Dependencies**: Slice A (parties) recommended but not required
 
@@ -497,22 +521,24 @@ Phases group slices into logical execution order. Each phase produces working ar
 
 ### Phase 2: Match Quality & Outcomes
 
-**Slices**: C (Team Balancing/Blowouts) + D (Performance/Skill Evolution)
+**Slices**: C (Team Balancing/Blowouts) ✅ **COMPLETE** + D (Performance/Skill Evolution)
 
 **Goal**: Improve match quality prediction and enable dynamic skill evolution.
 
 **Deliverables**:
-- Exact team balancing for small playlists
-- Enhanced blowout detection with severity
+- ✅ Exact team balancing for small playlists
+- ✅ Enhanced blowout detection with severity
 - Performance model and skill update rule
 - Skill distribution evolution tracking
 
 **Validation**:
-- Compare blowout rates with exact vs heuristic balancing
+- ✅ Compare blowout rates with exact vs heuristic balancing (ready for testing)
 - Verify skill evolution: players improve/decline based on performance
 - Track skill distribution stability over long runs
 
-**Estimated Effort**: 3-4 weeks
+**Status**: Slice C complete. Slice D remaining.
+
+**Estimated Effort**: 3-4 weeks (Slice C: ~1 week, Slice D: ~2-3 weeks)
 
 ---
 
@@ -583,24 +609,29 @@ Phases group slices into logical execution order. Each phase produces working ar
 
 This section documents canonical experiments that can be run once the relevant slices are implemented. Each experiment should be reproducible via the frontend experiment runner.
 
-### Experiment 1: SBMM Strictness Sweep
+### Experiment 1: SBMM Strictness Sweep ✅ **READY**
 
-**Dependencies**: Slices A, B, C
+**Dependencies**: Slices A ✅, B ✅, C ✅
 
 **Parameters**: Vary `skill_similarity_initial` from 0.01 to 0.3
 
 **Metrics to Track**:
 - Search time (P50, P90, P99) by skill bucket
 - Delta ping by skill bucket
-- Blowout rate overall and by bucket
+- Blowout rate overall and by bucket (now includes severity breakdown)
 - Skill disparity distribution
+- Team skill difference distribution (new from Slice C)
+- Per-playlist blowout rates (new from Slice C)
 
 **Expected Results**:
 - Tighter SBMM → longer search times, especially for extreme skill buckets
 - Tighter SBMM → lower blowout rate, better skill matching
 - Tradeoff: search time vs match quality
+- Exact team balancing should reduce blowout rates compared to snake draft
 
 **Config Preset**: `experiments/sbmm_strictness_sweep.json`
+
+**Status**: All dependencies complete. Experiment can be run with enhanced metrics from Slice C.
 
 ---
 
