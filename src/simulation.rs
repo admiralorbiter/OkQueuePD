@@ -3,7 +3,7 @@ use crate::types::*;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Main simulation state and controller
 #[derive(Serialize, Deserialize)]
@@ -26,6 +26,9 @@ pub struct Simulation {
     next_player_id: usize,
     next_search_id: usize,
     next_match_id: usize,
+    next_party_id: usize,
+    /// Active parties
+    pub parties: HashMap<usize, Party>,
     /// Random number generator seed
     rng_seed: u64,
     /// Arrival rate (players per tick)
@@ -45,6 +48,8 @@ impl Simulation {
             next_player_id: 0,
             next_search_id: 0,
             next_match_id: 0,
+            next_party_id: 0,
+            parties: HashMap::new(),
             rng_seed: seed,
             arrival_rate: 10.0,
         }
@@ -170,6 +175,71 @@ impl Simulation {
 
         // Calculate skill percentiles
         self.update_skill_percentiles();
+
+        // ---------------------------------------------------------------------
+        // Auto-generate parties from the population based on config
+        // ---------------------------------------------------------------------
+        let target_fraction = self
+            .config
+            .party_player_fraction
+            .clamp(0.0, 1.0);
+
+        if target_fraction > 0.0 && self.players.len() >= 2 {
+            use rand::seq::SliceRandom;
+
+            // Re-seed RNG so party generation is stable given the same seed
+            let mut rng = StdRng::seed_from_u64(self.rng_seed.wrapping_add(1));
+
+            let mut player_ids: Vec<usize> = self.players.keys().copied().collect();
+            player_ids.shuffle(&mut rng);
+
+            let total_players = player_ids.len();
+            let target_party_players =
+                ((total_players as f64) * target_fraction).round() as usize;
+
+            let mut assigned_players = 0usize;
+            let mut idx = 0usize;
+
+            while idx + 1 < total_players && assigned_players < target_party_players {
+                let remaining = total_players - idx;
+
+                // Sample a party size between 2-4, capped by remaining players
+                let max_size = remaining.min(4);
+                if max_size < 2 {
+                    break;
+                }
+
+                let size = match max_size {
+                    2 => 2,
+                    3 => if rng.gen_bool(0.6) { 3 } else { 2 },
+                    _ => {
+                        // For 4+ remaining players, bias slightly toward 2-3 person parties
+                        let r: f64 = rng.gen();
+                        if r < 0.5 {
+                            2
+                        } else if r < 0.85 {
+                            3
+                        } else {
+                            4
+                        }
+                    }
+                };
+
+                if idx + size > total_players {
+                    break;
+                }
+
+                let party_slice = &player_ids[idx..idx + size];
+                let party_member_ids: Vec<usize> = party_slice.to_vec();
+
+                // Ignore errors (e.g., if any player is already in a party)
+                if self.create_party(party_member_ids).is_ok() {
+                    assigned_players += size;
+                }
+
+                idx += size;
+            }
+        }
     }
 
     /// Generate skill value using a beta-like distribution
@@ -238,6 +308,55 @@ impl Simulation {
 
     /// Start a search for a player
     fn start_search(&mut self, player_id: usize) {
+        let player = match self.players.get(&player_id) {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Check if player is in a party
+        if let Some(party_id) = player.party_id {
+            // Party search: only leader can start search
+            if let Some(party) = self.parties.get(&party_id) {
+                if party.leader_id != player_id {
+                    // Not the leader, cannot start search
+                    return;
+                }
+
+                // Check if all party members are ready (IN_LOBBY state)
+                let all_ready = party.player_ids.iter().all(|&pid| {
+                    self.players.get(&pid)
+                        .map(|p| p.state == PlayerState::InLobby)
+                        .unwrap_or(false)
+                });
+
+                if !all_ready {
+                    // Not all members are ready
+                    return;
+                }
+
+                // Set all party members to SEARCHING
+                for &pid in &party.player_ids {
+                    if let Some(p) = self.players.get_mut(&pid) {
+                        p.state = PlayerState::Searching;
+                        p.search_start_time = Some(self.current_time);
+                    }
+                }
+
+                // Create SearchObject from party
+                let search = party.to_search_object(
+                    self.next_search_id,
+                    self.current_time,
+                    &self.players,
+                    &self.config,
+                );
+
+                self.next_search_id += 1;
+                self.searches.push(search);
+                return;
+            }
+        }
+
+        // Solo search (existing logic)
         let player = match self.players.get_mut(&player_id) {
             Some(p) => p,
             None => return,
@@ -281,6 +400,7 @@ impl Simulation {
             &mut self.searches,
             &mut self.players,
             &mut self.data_centers,
+            &self.parties,
             self.current_time,
             &mut rng,
         )
@@ -321,6 +441,19 @@ impl Simulation {
                 avg_delta_ping: result.avg_delta_ping,
             };
 
+            // Check if match involves parties
+            let has_party = result.player_ids.iter().any(|&pid| {
+                self.players.get(&pid)
+                    .map(|p| p.party_id.is_some())
+                    .unwrap_or(false)
+            });
+
+            if has_party {
+                self.stats.party_match_count += 1;
+            } else {
+                self.stats.solo_match_count += 1;
+            }
+
             // Update player states
             for &player_id in &result.player_ids {
                 if let Some(player) = self.players.get_mut(&player_id) {
@@ -332,6 +465,13 @@ impl Simulation {
                             player.recent_search_times.remove(0);
                         }
                         self.stats.search_time_samples.push(search_time);
+                        
+                        // Track party vs solo search times
+                        if player.party_id.is_some() {
+                            self.stats.party_search_times.push(search_time);
+                        } else {
+                            self.stats.solo_search_times.push(search_time);
+                        }
                     }
 
                     // Record delta ping
@@ -427,7 +567,8 @@ impl Simulation {
                             };
                             let blowout_penalty = blowout_rate * 0.2;
                             
-                            let continue_prob = (base_prob - ping_penalty - search_penalty - blowout_penalty).max(0.3);
+                            let continue_prob = (base_prob - ping_penalty - search_penalty - blowout_penalty).max(0.3).min(1.0);
+                            let continue_prob = if continue_prob.is_finite() { continue_prob } else { 0.5 };
 
                             if rng.gen_bool(continue_prob) {
                                 player.state = PlayerState::InLobby;
@@ -451,7 +592,10 @@ impl Simulation {
         
         // Win probability based on skill difference (logistic)
         let gamma = 2.0;
-        let p_team0_wins = 1.0 / (1.0 + (-gamma * skill_diff).exp());
+        let p_team0_wins = (1.0 / (1.0 + (-gamma * skill_diff).exp())).clamp(0.0, 1.0);
+        
+        // Ensure probability is valid (not NaN or infinite)
+        let p_team0_wins = if p_team0_wins.is_finite() { p_team0_wins } else { 0.5 };
         
         let winning_team = if rng.gen_bool(p_team0_wins) { 0 } else { 1 };
         
@@ -484,6 +628,10 @@ impl Simulation {
                 0.02
             }
         };
+        
+        // Ensure blowout probability is valid
+        let blowout_prob = blowout_prob.clamp(0.0, 1.0);
+        let blowout_prob = if blowout_prob.is_finite() { blowout_prob } else { 0.0 };
         
         let is_blowout = rng.gen_bool(blowout_prob);
         
@@ -609,6 +757,15 @@ impl Simulation {
         
         // Calculate per-bucket statistics
         self.update_bucket_stats();
+        
+        // Calculate party statistics
+        self.stats.party_count = self.parties.len();
+        if !self.parties.is_empty() {
+            let total_party_size: usize = self.parties.values().map(|p| p.size()).sum();
+            self.stats.avg_party_size = total_party_size as f64 / self.parties.len() as f64;
+        } else {
+            self.stats.avg_party_size = 0.0;
+        }
     }
 
     fn update_bucket_stats(&mut self) {
@@ -725,6 +882,152 @@ impl Simulation {
             .collect()
     }
 
+    /// Get all player IDs in a party
+    pub fn get_party_members(&self, party_id: usize) -> Vec<usize> {
+        self.parties
+            .get(&party_id)
+            .map(|p| p.player_ids.clone())
+            .unwrap_or_default()
+    }
+
+    /// Create a new party from a list of player IDs
+    pub fn create_party(&mut self, player_ids: Vec<usize>) -> Result<usize, String> {
+        if player_ids.is_empty() {
+            return Err("Cannot create party with no players".to_string());
+        }
+
+        // Validate all players exist and are not in other parties
+        let mut party_players = Vec::new();
+        for &player_id in &player_ids {
+            let player = self.players.get(&player_id)
+                .ok_or_else(|| format!("Player {} does not exist", player_id))?;
+            
+            if player.party_id.is_some() {
+                return Err(format!("Player {} is already in a party", player_id));
+            }
+
+            // Validate players are in compatible states (IN_LOBBY or OFFLINE)
+            if !matches!(player.state, PlayerState::InLobby | PlayerState::Offline) {
+                return Err(format!("Player {} is not in a valid state to join party", player_id));
+            }
+
+            party_players.push(player);
+        }
+
+        // Validate party size (max 6 for most playlists)
+        if player_ids.len() > 6 {
+            return Err("Party size cannot exceed 6 players".to_string());
+        }
+
+        // Create party
+        let party_id = self.next_party_id;
+        self.next_party_id += 1;
+
+        let party = Party::from_players(party_id, &party_players);
+
+        // Set party_id for all members
+        for &player_id in &player_ids {
+            if let Some(player) = self.players.get_mut(&player_id) {
+                player.party_id = Some(party_id);
+            }
+        }
+
+        self.parties.insert(party_id, party);
+        Ok(party_id)
+    }
+
+    /// Add a player to an existing party
+    pub fn join_party(&mut self, party_id: usize, player_id: usize) -> Result<(), String> {
+        let party = self.parties.get_mut(&party_id)
+            .ok_or_else(|| format!("Party {} does not exist", party_id))?;
+
+        // Validate party capacity (max 6)
+        if party.size() >= 6 {
+            return Err("Party is at maximum capacity".to_string());
+        }
+
+        // Validate player exists and is not in another party
+        let player = self.players.get(&player_id)
+            .ok_or_else(|| format!("Player {} does not exist", player_id))?;
+
+        if player.party_id.is_some() {
+            return Err(format!("Player {} is already in a party", player_id));
+        }
+
+        // Validate player is in compatible state
+        if !matches!(player.state, PlayerState::InLobby | PlayerState::Offline) {
+            return Err(format!("Player {} is not in a valid state to join party", player_id));
+        }
+
+        // Add player to party
+        party.player_ids.push(player_id);
+        
+        // Update player's party_id
+        if let Some(player) = self.players.get_mut(&player_id) {
+            player.party_id = Some(party_id);
+        }
+
+        // Update party aggregates
+        party.update_aggregates(&self.players);
+        Ok(())
+    }
+
+    /// Remove a player from a party
+    pub fn leave_party(&mut self, party_id: usize, player_id: usize) -> Result<(), String> {
+        let party = self.parties.get_mut(&party_id)
+            .ok_or_else(|| format!("Party {} does not exist", party_id))?;
+
+        // Validate player is a member
+        if !party.player_ids.contains(&player_id) {
+            return Err(format!("Player {} is not a member of party {}", player_id, party_id));
+        }
+
+        // Remove player from party
+        party.player_ids.retain(|&id| id != player_id);
+
+        // Clear player's party_id
+        if let Some(player) = self.players.get_mut(&player_id) {
+            player.party_id = None;
+        }
+
+        // If party becomes empty, disband it
+        if party.player_ids.is_empty() {
+            self.parties.remove(&party_id);
+            return Ok(());
+        }
+
+        // If leader left, assign new leader (next player in list)
+        if party.leader_id == player_id {
+            party.leader_id = party.player_ids[0];
+        }
+
+        // Update party aggregates
+        party.update_aggregates(&self.players);
+        Ok(())
+    }
+
+    /// Disband a party completely
+    pub fn disband_party(&mut self, party_id: usize) -> Result<(), String> {
+        let party = self.parties.remove(&party_id)
+            .ok_or_else(|| format!("Party {} does not exist", party_id))?;
+
+        // Clear party_id for all members
+        for &player_id in &party.player_ids {
+            if let Some(player) = self.players.get_mut(&player_id) {
+                player.party_id = None;
+                
+                // If any members were searching, remove their search objects
+                if player.state == PlayerState::Searching {
+                    player.state = PlayerState::InLobby;
+                    // Remove search objects containing this player
+                    self.searches.retain(|s| !s.player_ids.contains(&player_id));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Update config parameter
     pub fn update_config(&mut self, config: MatchmakingConfig) {
         self.config = config;
@@ -738,4 +1041,218 @@ pub struct SimulationState {
     pub total_players: usize,
     pub stats: SimulationStats,
     pub config: MatchmakingConfig,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_test_simulation() -> Simulation {
+        let config = MatchmakingConfig::default();
+        let mut sim = Simulation::new(config, 42);
+        sim.init_default_data_centers();
+        sim.generate_population(100, None);
+        sim
+    }
+
+    #[test]
+    fn test_create_party() {
+        let mut sim = create_test_simulation();
+        
+        // Get some players
+        let player_ids: Vec<usize> = sim.players.keys().take(3).copied().collect();
+        
+        // Set players to InLobby state
+        for &pid in &player_ids {
+            if let Some(player) = sim.players.get_mut(&pid) {
+                player.state = PlayerState::InLobby;
+            }
+        }
+        
+        // Create party
+        let party_id = sim.create_party(player_ids.clone()).unwrap();
+        
+        // Verify party exists
+        assert!(sim.parties.contains_key(&party_id));
+        
+        // Verify all players have party_id set
+        for &pid in &player_ids {
+            assert_eq!(sim.players.get(&pid).unwrap().party_id, Some(party_id));
+        }
+        
+        // Verify party has correct members
+        let party = sim.parties.get(&party_id).unwrap();
+        assert_eq!(party.player_ids.len(), 3);
+        assert_eq!(party.leader_id, player_ids[0]);
+    }
+
+    #[test]
+    fn test_create_party_duplicate_player() {
+        let mut sim = create_test_simulation();
+        let player_ids: Vec<usize> = sim.players.keys().take(2).copied().collect();
+        
+        for &pid in &player_ids {
+            if let Some(player) = sim.players.get_mut(&pid) {
+                player.state = PlayerState::InLobby;
+            }
+        }
+        
+        // Create first party
+        sim.create_party(player_ids.clone()).unwrap();
+        
+        // Try to create another party with same player - should fail
+        let result = sim.create_party(vec![player_ids[0], player_ids[1]]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_join_party() {
+        let mut sim = create_test_simulation();
+        let player_ids: Vec<usize> = sim.players.keys().take(4).copied().collect();
+        
+        for &pid in &player_ids {
+            if let Some(player) = sim.players.get_mut(&pid) {
+                player.state = PlayerState::InLobby;
+            }
+        }
+        
+        // Create party with first 2 players
+        let party_id = sim.create_party(player_ids[0..2].to_vec()).unwrap();
+        
+        // Join third player
+        sim.join_party(party_id, player_ids[2]).unwrap();
+        
+        let party = sim.parties.get(&party_id).unwrap();
+        assert_eq!(party.player_ids.len(), 3);
+        assert_eq!(sim.players.get(&player_ids[2]).unwrap().party_id, Some(party_id));
+    }
+
+    #[test]
+    fn test_leave_party() {
+        let mut sim = create_test_simulation();
+        let player_ids: Vec<usize> = sim.players.keys().take(3).copied().collect();
+        
+        for &pid in &player_ids {
+            if let Some(player) = sim.players.get_mut(&pid) {
+                player.state = PlayerState::InLobby;
+            }
+        }
+        
+        let party_id = sim.create_party(player_ids.clone()).unwrap();
+        let leader_id = player_ids[0];
+        
+        // Leave party (non-leader)
+        sim.leave_party(party_id, player_ids[1]).unwrap();
+        
+        let party = sim.parties.get(&party_id).unwrap();
+        assert_eq!(party.player_ids.len(), 2);
+        assert_eq!(sim.players.get(&player_ids[1]).unwrap().party_id, None);
+        
+        // Leader should still be leader
+        assert_eq!(party.leader_id, leader_id);
+    }
+
+    #[test]
+    fn test_leave_party_leader_reassignment() {
+        let mut sim = create_test_simulation();
+        let player_ids: Vec<usize> = sim.players.keys().take(3).copied().collect();
+        
+        for &pid in &player_ids {
+            if let Some(player) = sim.players.get_mut(&pid) {
+                player.state = PlayerState::InLobby;
+            }
+        }
+        
+        let party_id = sim.create_party(player_ids.clone()).unwrap();
+        let old_leader = player_ids[0];
+        let new_leader = player_ids[1];
+        
+        // Leader leaves
+        sim.leave_party(party_id, old_leader).unwrap();
+        
+        let party = sim.parties.get(&party_id).unwrap();
+        // New leader should be next player in list
+        assert_eq!(party.leader_id, new_leader);
+    }
+
+    #[test]
+    fn test_disband_party() {
+        let mut sim = create_test_simulation();
+        let player_ids: Vec<usize> = sim.players.keys().take(3).copied().collect();
+        
+        for &pid in &player_ids {
+            if let Some(player) = sim.players.get_mut(&pid) {
+                player.state = PlayerState::InLobby;
+            }
+        }
+        
+        let party_id = sim.create_party(player_ids.clone()).unwrap();
+        
+        // Disband party
+        sim.disband_party(party_id).unwrap();
+        
+        // Party should be removed
+        assert!(!sim.parties.contains_key(&party_id));
+        
+        // All players should have party_id cleared
+        for &pid in &player_ids {
+            assert_eq!(sim.players.get(&pid).unwrap().party_id, None);
+        }
+    }
+
+    #[test]
+    fn test_party_search_creates_single_search_object() {
+        let mut sim = create_test_simulation();
+        let player_ids: Vec<usize> = sim.players.keys().take(3).copied().collect();
+        
+        for &pid in &player_ids {
+            if let Some(player) = sim.players.get_mut(&pid) {
+                player.state = PlayerState::InLobby;
+            }
+        }
+        
+        let party_id = sim.create_party(player_ids.clone()).unwrap();
+        
+        // Start search (leader starts)
+        sim.start_search(player_ids[0]);
+        
+        // Should have exactly one search object with all party members
+        assert_eq!(sim.searches.len(), 1);
+        let search = &sim.searches[0];
+        assert_eq!(search.player_ids.len(), 3);
+        assert_eq!(search.player_ids, player_ids);
+        
+        // All party members should be searching
+        for &pid in &player_ids {
+            assert_eq!(sim.players.get(&pid).unwrap().state, PlayerState::Searching);
+        }
+    }
+
+    #[test]
+    fn test_party_aggregates() {
+        let mut sim = create_test_simulation();
+        let player_ids: Vec<usize> = sim.players.keys().take(3).copied().collect();
+        
+        // Set different skills for players
+        let skills = vec![0.5, 0.3, 0.7];
+        for (i, &pid) in player_ids.iter().enumerate() {
+            if let Some(player) = sim.players.get_mut(&pid) {
+                player.skill = skills[i];
+                player.skill_percentile = skills[i];
+                player.state = PlayerState::InLobby;
+            }
+        }
+        
+        sim.update_skill_percentiles();
+        
+        let party_id = sim.create_party(player_ids.clone()).unwrap();
+        let party = sim.parties.get(&party_id).unwrap();
+        
+        // Verify aggregates
+        let expected_avg = (0.5 + 0.3 + 0.7) / 3.0;
+        assert!((party.avg_skill - expected_avg).abs() < 0.001);
+        
+        let expected_disparity = 0.7 - 0.3;
+        assert!((party.skill_disparity - expected_disparity).abs() < 0.001);
+    }
 }

@@ -200,6 +200,7 @@ impl Matchmaker {
         searches: &mut Vec<SearchObject>,
         players: &mut HashMap<usize, Player>,
         data_centers: &mut [DataCenter],
+        parties: &HashMap<usize, Party>,
         current_time: u64,
         rng: &mut impl Rng,
     ) -> Vec<MatchResult> {
@@ -354,7 +355,7 @@ impl Matchmaker {
                             .collect();
 
                         // Create teams using skill-based balancing
-                        let teams = self.balance_teams(&all_players, players, playlist, rng);
+                        let teams = self.balance_teams(&all_players, players, parties, playlist, rng);
 
                         // Mark searches as matched
                         for &idx in &lobby_indices {
@@ -389,11 +390,12 @@ impl Matchmaker {
         results
     }
 
-    /// Balance teams based on skill
+    /// Balance teams based on skill, respecting party boundaries
     fn balance_teams(
         &self,
         player_ids: &[usize],
         players: &HashMap<usize, Player>,
+        parties: &HashMap<usize, Party>,
         playlist: Playlist,
         rng: &mut impl Rng,
     ) -> Vec<Vec<usize>> {
@@ -404,26 +406,50 @@ impl Matchmaker {
             return player_ids.iter().map(|&id| vec![id]).collect();
         }
 
-        let players_per_team = player_ids.len() / team_count;
-        
-        // Sort players by skill
-        let mut sorted_players: Vec<_> = player_ids
-            .iter()
-            .map(|&id| {
-                let skill = players.get(&id).map(|p| p.skill).unwrap_or(0.0);
-                (id, skill)
-            })
-            .collect();
-        sorted_players.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        // Group players by party_id (solo players are their own "party")
+        let mut party_groups: HashMap<Option<usize>, Vec<usize>> = HashMap::new();
+        for &player_id in player_ids {
+            let party_id = players.get(&player_id).and_then(|p| p.party_id);
+            party_groups.entry(party_id).or_insert_with(Vec::new).push(player_id);
+        }
 
-        // Snake draft for balanced teams
+        // Compute party aggregates and create party entries for balancing
+        let mut party_entries: Vec<(Option<usize>, Vec<usize>, f64)> = Vec::new();
+        for (party_id, member_ids) in party_groups {
+            let avg_skill = if let Some(pid) = party_id {
+                // Get avg_skill from party
+                parties.get(&pid)
+                    .map(|p| p.avg_skill)
+                    .unwrap_or_else(|| {
+                        // Fallback: compute from members
+                        member_ids.iter()
+                            .filter_map(|id| players.get(id).map(|p| p.skill))
+                            .sum::<f64>() / member_ids.len() as f64
+                    })
+            } else {
+                // Solo player: use individual skill
+                member_ids.first()
+                    .and_then(|id| players.get(id).map(|p| p.skill))
+                    .unwrap_or(0.0)
+            };
+            party_entries.push((party_id, member_ids, avg_skill));
+        }
+
+        // Sort parties by avg_skill (descending)
+        party_entries.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+
+        // Snake draft: assign entire parties to teams
         let mut teams: Vec<Vec<usize>> = vec![Vec::new(); team_count];
         let mut forward = true;
         let mut team_idx = 0;
 
-        for (player_id, _) in sorted_players {
-            teams[team_idx].push(player_id);
+        for (_, member_ids, _) in party_entries {
+            // Assign all members of this party to the same team
+            for &player_id in &member_ids {
+                teams[team_idx].push(player_id);
+            }
             
+            // Move to next team in snake draft
             if forward {
                 if team_idx == team_count - 1 {
                     forward = false;
@@ -439,14 +465,8 @@ impl Matchmaker {
             }
         }
 
-        // Slight randomization to avoid determinism
-        for team in &mut teams {
-            if rng.gen_bool(0.3) && team.len() > 1 {
-                let i = rng.gen_range(0..team.len());
-                let j = rng.gen_range(0..team.len());
-                team.swap(i, j);
-            }
-        }
+        // Verify team sizes are balanced (allow small differences due to party sizes)
+        // No randomization needed since party integrity is maintained
 
         teams
     }

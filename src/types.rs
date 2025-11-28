@@ -254,15 +254,201 @@ pub struct Party {
     pub id: usize,
     pub player_ids: Vec<usize>,
     pub leader_id: usize,
-    /// Average skill of party
+    /// Average skill of party (raw skill)
     pub avg_skill: f64,
-    /// Skill disparity within party
+    /// Skill disparity within party (raw skill)
     pub skill_disparity: f64,
+    /// Average skill percentile
+    pub avg_skill_percentile: f64,
+    /// Skill percentile disparity
+    pub skill_percentile_disparity: f64,
+    /// Preferred playlists (intersection of all party members' preferences)
+    pub preferred_playlists: HashSet<Playlist>,
+    /// Platform composition (platform -> count)
+    pub platforms: HashMap<Platform, usize>,
+    /// Input device composition (input device -> count)
+    pub input_devices: HashMap<InputDevice, usize>,
+    /// Average location (centroid of party member locations)
+    pub avg_location: Location,
 }
 
 impl Party {
     pub fn size(&self) -> usize {
         self.player_ids.len()
+    }
+
+    /// Construct a party from player references, computing all aggregates
+    /// Per whitepaper §2.4: avg_skill, skill_disparity, avg_percentile, percentile_disparity
+    pub fn from_players(id: usize, players: &[&Player]) -> Self {
+        if players.is_empty() {
+            panic!("Cannot create party from empty player list");
+        }
+
+        let player_ids: Vec<usize> = players.iter().map(|p| p.id).collect();
+        let leader_id = players[0].id;
+
+        // Compute skill aggregates (raw skill)
+        let skills: Vec<f64> = players.iter().map(|p| p.skill).collect();
+        let avg_skill = skills.iter().sum::<f64>() / skills.len() as f64;
+        let skill_disparity = {
+            let min_skill = skills.iter().fold(f64::MAX, |a, &b| a.min(b));
+            let max_skill = skills.iter().fold(f64::MIN, |a, &b| a.max(b));
+            max_skill - min_skill
+        };
+
+        // Compute percentile aggregates
+        let percentiles: Vec<f64> = players.iter().map(|p| p.skill_percentile).collect();
+        let avg_skill_percentile = percentiles.iter().sum::<f64>() / percentiles.len() as f64;
+        let skill_percentile_disparity = {
+            let min_percentile = percentiles.iter().fold(f64::MAX, |a, &b| a.min(b));
+            let max_percentile = percentiles.iter().fold(f64::MIN, |a, &b| a.max(b));
+            max_percentile - min_percentile
+        };
+
+        // Compute preferred playlists (intersection of all members)
+        let mut preferred_playlists = players[0].preferred_playlists.clone();
+        for player in players.iter().skip(1) {
+            preferred_playlists = preferred_playlists
+                .intersection(&player.preferred_playlists)
+                .copied()
+                .collect();
+        }
+
+        // Compute platform composition
+        let mut platforms = HashMap::new();
+        for player in players {
+            *platforms.entry(player.platform).or_insert(0) += 1;
+        }
+
+        // Compute input device composition
+        let mut input_devices = HashMap::new();
+        for player in players {
+            *input_devices.entry(player.input_device).or_insert(0) += 1;
+        }
+
+        // Compute average location (centroid)
+        let avg_location = {
+            let total_lat: f64 = players.iter().map(|p| p.location.lat).sum();
+            let total_lon: f64 = players.iter().map(|p| p.location.lon).sum();
+            let count = players.len() as f64;
+            Location::new(total_lat / count, total_lon / count)
+        };
+
+        Self {
+            id,
+            player_ids,
+            leader_id,
+            avg_skill,
+            skill_disparity,
+            avg_skill_percentile,
+            skill_percentile_disparity,
+            preferred_playlists,
+            platforms,
+            input_devices,
+            avg_location,
+        }
+    }
+
+    /// Recompute aggregates when party membership changes
+    pub fn update_aggregates(&mut self, players: &HashMap<usize, Player>) {
+        let party_players: Vec<&Player> = self.player_ids
+            .iter()
+            .filter_map(|id| players.get(id))
+            .collect();
+
+        if party_players.is_empty() {
+            return;
+        }
+
+        // Update skill aggregates (raw skill)
+        let skills: Vec<f64> = party_players.iter().map(|p| p.skill).collect();
+        self.avg_skill = skills.iter().sum::<f64>() / skills.len() as f64;
+        self.skill_disparity = {
+            let min_skill = skills.iter().fold(f64::MAX, |a, &b| a.min(b));
+            let max_skill = skills.iter().fold(f64::MIN, |a, &b| a.max(b));
+            max_skill - min_skill
+        };
+
+        // Update percentile aggregates
+        let percentiles: Vec<f64> = party_players.iter().map(|p| p.skill_percentile).collect();
+        self.avg_skill_percentile = percentiles.iter().sum::<f64>() / percentiles.len() as f64;
+        self.skill_percentile_disparity = {
+            let min_percentile = percentiles.iter().fold(f64::MAX, |a, &b| a.min(b));
+            let max_percentile = percentiles.iter().fold(f64::MIN, |a, &b| a.max(b));
+            max_percentile - min_percentile
+        };
+
+        // Update preferred playlists (intersection)
+        if let Some(first_player) = party_players.first() {
+            self.preferred_playlists = first_player.preferred_playlists.clone();
+            for player in party_players.iter().skip(1) {
+                self.preferred_playlists = self.preferred_playlists
+                    .intersection(&player.preferred_playlists)
+                    .copied()
+                    .collect();
+            }
+        }
+
+        // Update platform composition
+        self.platforms.clear();
+        for player in &party_players {
+            *self.platforms.entry(player.platform).or_insert(0) += 1;
+        }
+
+        // Update input device composition
+        self.input_devices.clear();
+        for player in &party_players {
+            *self.input_devices.entry(player.input_device).or_insert(0) += 1;
+        }
+
+        // Update average location (centroid)
+        let total_lat: f64 = party_players.iter().map(|p| p.location.lat).sum();
+        let total_lon: f64 = party_players.iter().map(|p| p.location.lon).sum();
+        let count = party_players.len() as f64;
+        self.avg_location = Location::new(total_lat / count, total_lon / count);
+    }
+
+    /// Convert party to SearchObject with proper DC intersection
+    pub fn to_search_object(
+        &self,
+        search_id: usize,
+        search_start_time: u64,
+        players: &HashMap<usize, Player>,
+        config: &MatchmakingConfig,
+    ) -> SearchObject {
+        let party_players: Vec<&Player> = self.player_ids
+            .iter()
+            .filter_map(|id| players.get(id))
+            .collect();
+
+        // Compute acceptable DCs as intersection of all party members' acceptable DCs
+        let wait_time = 0.0; // Initial wait time when search starts
+        let mut acceptable_dcs: Option<HashSet<usize>> = None;
+        
+        for player in &party_players {
+            let player_dcs: HashSet<usize> = player
+                .acceptable_dcs(wait_time, config)
+                .into_iter()
+                .collect();
+            
+            acceptable_dcs = Some(match acceptable_dcs {
+                None => player_dcs,
+                Some(existing) => existing.intersection(&player_dcs).copied().collect(),
+            });
+        }
+
+        SearchObject {
+            id: search_id,
+            player_ids: self.player_ids.clone(),
+            avg_skill_percentile: self.avg_skill_percentile,
+            skill_disparity: self.skill_percentile_disparity,
+            avg_location: self.avg_location,
+            platforms: self.platforms.clone(),
+            input_devices: self.input_devices.clone(),
+            acceptable_playlists: self.preferred_playlists.clone(),
+            search_start_time,
+            acceptable_dcs: acceptable_dcs.unwrap_or_default(),
+        }
     }
 }
 
@@ -352,6 +538,11 @@ pub struct MatchmakingConfig {
     pub quality_weight_skill_balance: f64,
     pub quality_weight_wait_time: f64,
     
+    /// Fraction of players that participate in parties (0.0 - 1.0)
+    /// This controls the baseline solo vs party mix in the simulation.
+    /// Parties are auto-generated from the population using this target fraction.
+    pub party_player_fraction: f64,
+    
     /// Matchmaking tick interval (seconds)
     pub tick_interval: f64,
     
@@ -382,6 +573,9 @@ impl Default for MatchmakingConfig {
             quality_weight_ping: 0.4,
             quality_weight_skill_balance: 0.4,
             quality_weight_wait_time: 0.2,
+            // By default, target roughly 50% of players being in parties,
+            // with party sizes drawn between 2-4 members.
+            party_player_fraction: 0.5,
             tick_interval: 5.0,
             num_skill_buckets: 10,
             top_k_candidates: 50,
@@ -454,6 +648,14 @@ pub struct SimulationStats {
     
     /// Per skill bucket statistics
     pub bucket_stats: HashMap<usize, BucketStats>,
+    
+    /// Party statistics
+    pub party_count: usize,
+    pub avg_party_size: f64,
+    pub party_match_count: usize,
+    pub solo_match_count: usize,
+    pub party_search_times: Vec<f64>,
+    pub solo_search_times: Vec<f64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

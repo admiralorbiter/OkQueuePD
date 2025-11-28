@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ScatterChart, Scatter, Cell, RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar } from 'recharts';
+import init, { SimulationEngine } from './wasm/cod_matchmaking_sim.js';
 
 // ============================================================================
 // SIMULATION ENGINE (JavaScript implementation mirroring the Rust code)
@@ -58,644 +59,14 @@ const defaultConfig = {
   weightSkill: 0.4,
   weightInput: 0.15,
   weightPlatform: 0.15,
+  // Fraction of players that participate in parties (0-1).
+  // Defaults to ~50% to match the roadmap's party experiments.
+  partyPlayerFraction: 0.5,
   tickInterval: 5,
   numSkillBuckets: 10,
   topKCandidates: 50,
   arrivalRate: 10,
 };
-
-class SimulationEngine {
-  constructor(config = defaultConfig, seed = 12345) {
-    this.config = { ...defaultConfig, ...config };
-    this.seed = seed;
-    this.rng = this.createRng(seed);
-    this.reset();
-  }
-
-  createRng(seed) {
-    let s = seed;
-    return () => {
-      s = (s * 1103515245 + 12345) & 0x7fffffff;
-      return s / 0x7fffffff;
-    };
-  }
-
-  reset() {
-    this.currentTime = 0;
-    this.players = new Map();
-    this.searches = [];
-    this.matches = new Map();
-    this.nextPlayerId = 0;
-    this.nextSearchId = 0;
-    this.nextMatchId = 0;
-    this.dcServers = DATA_CENTERS.map(dc => ({ ...dc, busy: {} }));
-    Object.keys(PLAYLISTS).forEach(p => this.dcServers.forEach(dc => dc.busy[p] = 0));
-    
-    this.stats = {
-      totalMatches: 0,
-      searchTimeSamples: [],
-      deltaPingSamples: [],
-      skillDisparitySamples: [],
-      blowoutCount: 0,
-      timeSeriesData: [],
-    };
-    
-    this.rng = this.createRng(this.seed);
-  }
-
-  generatePopulation(count) {
-    // Clear existing players first
-    this.players.clear();
-    this.nextPlayerId = 0;
-    
-    console.log(`Generating population of ${count} players...`);
-    
-    const regions = [
-      { loc: new Location(39, -95), weight: 0.35 },
-      { loc: new Location(50, 10), weight: 0.30 },
-      { loc: new Location(35, 105), weight: 0.20 },
-      { loc: new Location(-25, 135), weight: 0.08 },
-      { loc: new Location(-15, -55), weight: 0.07 },
-    ];
-
-    for (let i = 0; i < count; i++) {
-      const r = this.rng();
-      let cumulative = 0;
-      let regionLoc = regions[0].loc;
-      for (const reg of regions) {
-        cumulative += reg.weight;
-        if (r < cumulative) {
-          regionLoc = reg.loc;
-          break;
-        }
-      }
-
-      const location = new Location(
-        regionLoc.lat + (this.rng() - 0.5) * 20,
-        regionLoc.lon + (this.rng() - 0.5) * 30
-      );
-
-      // Skill: approximate normal distribution
-      let skill = 0;
-      for (let j = 0; j < 12; j++) skill += this.rng();
-      skill = ((skill - 6) / 3);
-      skill = Math.max(-1, Math.min(1, skill));
-
-      const player = {
-        id: this.nextPlayerId++,
-        location,
-        platform: ['PC', 'PlayStation', 'Xbox'][Math.floor(this.rng() * 3)],
-        inputDevice: this.rng() < 0.6 ? 'Controller' : 'MouseKeyboard',
-        skill,
-        skillPercentile: 0.5,
-        skillBucket: 5,
-        state: 'Offline',
-        currentMatch: null,
-        preferredPlaylists: ['TeamDeathmatch'],
-        dcPings: {},
-        bestDc: null,
-        bestPing: 1000,
-        searchStartTime: null,
-        matchesPlayed: 0,
-        wins: 0,
-        losses: 0,
-        recentDeltaPings: [],
-        recentSearchTimes: [],
-        recentBlowouts: [],
-        continuationProb: 0.85,
-      };
-
-      // Add additional playlists
-      if (this.rng() < 0.4) player.preferredPlaylists.push('Domination');
-      if (this.rng() < 0.2) player.preferredPlaylists.push('SearchAndDestroy');
-
-      // Calculate pings
-      for (const dc of DATA_CENTERS) {
-        const baseDist = location.distanceKm(dc.location);
-        const basePing = baseDist / 100 + 15;
-        const jitter = (this.rng() - 0.5) * 15;
-        player.dcPings[dc.id] = Math.max(10, basePing + jitter);
-      }
-
-      let bestPing = Infinity, bestDc = null;
-      for (const [dcId, ping] of Object.entries(player.dcPings)) {
-        if (ping < bestPing) {
-          bestPing = ping;
-          bestDc = parseInt(dcId);
-        }
-      }
-      player.bestPing = bestPing;
-      player.bestDc = bestDc;
-
-      this.players.set(player.id, player);
-    }
-
-    this.updateSkillPercentiles();
-    console.log(`Population generated: ${this.players.size} players`);
-  }
-
-  updateSkillPercentiles() {
-    const sorted = [...this.players.values()].sort((a, b) => a.skill - b.skill);
-    const n = sorted.length;
-    sorted.forEach((p, i) => {
-      p.skillPercentile = (i + 0.5) / n;
-      p.skillBucket = Math.floor(p.skillPercentile * this.config.numSkillBuckets) + 1;
-      p.skillBucket = Math.max(1, Math.min(this.config.numSkillBuckets, p.skillBucket));
-    });
-  }
-
-  deltaPingBackoff(waitTime) {
-    return Math.min(
-      this.config.deltaPingInitial + this.config.deltaPingRate * waitTime,
-      this.config.deltaPingMax
-    );
-  }
-
-  skillSimilarityBackoff(waitTime) {
-    return Math.min(
-      this.config.skillSimilarityInitial + this.config.skillSimilarityRate * waitTime,
-      this.config.skillSimilarityMax
-    );
-  }
-
-  tick() {
-    // 1. Arrivals
-    const offlinePlayers = [...this.players.values()].filter(p => p.state === 'Offline');
-    const numArrivals = this.poissonSample(this.config.arrivalRate);
-    for (let i = 0; i < Math.min(numArrivals, offlinePlayers.length); i++) {
-      const idx = Math.floor(this.rng() * offlinePlayers.length);
-      const player = offlinePlayers.splice(idx, 1)[0];
-      player.state = 'InLobby';
-    }
-
-    // 2. Search starts
-    const lobbyPlayers = [...this.players.values()].filter(p => p.state === 'InLobby');
-    for (const player of lobbyPlayers) {
-      if (this.rng() < 0.3) {
-        this.startSearch(player);
-      }
-    }
-
-    // 3. Matchmaking
-    this.runMatchmaking();
-
-    // 4. Match completions
-    this.processMatchCompletions();
-
-    // 5. Update stats
-    this.updateStats();
-
-    this.currentTime++;
-  }
-
-  startSearch(player) {
-    player.state = 'Searching';
-    player.searchStartTime = this.currentTime;
-
-    const search = {
-      id: this.nextSearchId++,
-      playerIds: [player.id],
-      avgSkillPercentile: player.skillPercentile,
-      avgLocation: player.location,
-      acceptablePlaylists: [...player.preferredPlaylists],
-      searchStartTime: this.currentTime,
-      acceptableDcs: new Set(Object.keys(player.dcPings).map(Number)),
-    };
-
-    this.searches.push(search);
-  }
-
-  runMatchmaking() {
-    const matched = new Set();
-
-    // Update acceptable DCs
-    for (const search of this.searches) {
-      const waitTime = (this.currentTime - search.searchStartTime) * this.config.tickInterval;
-      const deltaPingAllowed = this.deltaPingBackoff(waitTime);
-      
-      const newDcs = new Set();
-      for (const playerId of search.playerIds) {
-        const player = this.players.get(playerId);
-        if (!player) continue;
-        
-        for (const [dcId, ping] of Object.entries(player.dcPings)) {
-          if (ping <= player.bestPing + deltaPingAllowed && ping <= this.config.maxPing) {
-            newDcs.add(parseInt(dcId));
-          }
-        }
-      }
-      search.acceptableDcs = newDcs;
-    }
-
-    // Sort by wait time (longest first)
-    const sortedSearches = [...this.searches].sort((a, b) => a.searchStartTime - b.searchStartTime);
-
-    // Process each playlist
-    for (const playlistName of Object.keys(PLAYLISTS)) {
-      const playlist = PLAYLISTS[playlistName];
-      const playlistSearches = sortedSearches.filter(s => 
-        !matched.has(s.id) && s.acceptablePlaylists.includes(playlistName)
-      );
-
-      for (const seed of playlistSearches) {
-        if (matched.has(seed.id)) continue;
-
-        // Find candidates
-        const candidates = playlistSearches
-          .filter(s => s.id !== seed.id && !matched.has(s.id))
-          .map(s => ({ search: s, dist: this.calculateDistance(seed, s) }))
-          .sort((a, b) => a.dist - b.dist)
-          .slice(0, this.config.topKCandidates);
-
-        // Greedy construction
-        const lobby = [seed];
-        let lobbySize = seed.playerIds.length;
-
-        for (const { search: cand } of candidates) {
-          if (lobbySize >= playlist.required) break;
-          if (lobbySize + cand.playerIds.length > playlist.required) continue;
-
-          if (this.checkFeasibility([...lobby, cand], playlistName)) {
-            lobby.push(cand);
-            lobbySize += cand.playerIds.length;
-          }
-        }
-
-        // Create match if full
-        if (lobbySize === playlist.required) {
-          const allPlayerIds = lobby.flatMap(s => s.playerIds);
-          
-          // Find common DC
-          let commonDcs = new Set(lobby[0].acceptableDcs);
-          for (const s of lobby.slice(1)) {
-            commonDcs = new Set([...commonDcs].filter(dc => s.acceptableDcs.has(dc)));
-          }
-          
-          const dcId = [...commonDcs][0];
-          if (dcId === undefined) continue;
-
-          // Calculate stats
-          const searchTimes = lobby.map(s => 
-            (this.currentTime - s.searchStartTime) * this.config.tickInterval
-          );
-          
-          let totalDeltaPing = 0;
-          for (const pid of allPlayerIds) {
-            const p = this.players.get(pid);
-            if (p) totalDeltaPing += (p.dcPings[dcId] || 0) - p.bestPing;
-          }
-          const avgDeltaPing = totalDeltaPing / allPlayerIds.length;
-
-          const skills = lobby.map(s => s.avgSkillPercentile);
-          const skillDisparity = Math.max(...skills) - Math.min(...skills);
-
-          // Create teams
-          const teams = this.balanceTeams(allPlayerIds, playlistName);
-          
-          const teamSkills = teams.map(team => {
-            const teamSkill = team.reduce((sum, pid) => {
-              const p = this.players.get(pid);
-              return sum + (p ? p.skill : 0);
-            }, 0) / team.length;
-            return teamSkill;
-          });
-
-          const match = {
-            id: this.nextMatchId++,
-            playlist: playlistName,
-            dcId,
-            teams,
-            teamSkills,
-            startTime: this.currentTime,
-            duration: Math.floor(playlist.duration * (0.8 + this.rng() * 0.4) / this.config.tickInterval),
-            skillDisparity,
-            avgDeltaPing,
-          };
-
-          // Update players
-          for (const pid of allPlayerIds) {
-            const p = this.players.get(pid);
-            if (p) {
-              const searchTime = (this.currentTime - (p.searchStartTime || this.currentTime)) * this.config.tickInterval;
-              p.recentSearchTimes.push(searchTime);
-              if (p.recentSearchTimes.length > 10) p.recentSearchTimes.shift();
-              this.stats.searchTimeSamples.push(searchTime);
-
-              const deltaPing = (p.dcPings[dcId] || 0) - p.bestPing;
-              p.recentDeltaPings.push(deltaPing);
-              if (p.recentDeltaPings.length > 10) p.recentDeltaPings.shift();
-              this.stats.deltaPingSamples.push(deltaPing);
-
-              p.state = 'InMatch';
-              p.currentMatch = match.id;
-              p.searchStartTime = null;
-            }
-          }
-
-          this.stats.skillDisparitySamples.push(skillDisparity);
-          this.matches.set(match.id, match);
-          this.stats.totalMatches++;
-
-          lobby.forEach(s => matched.add(s.id));
-        }
-      }
-    }
-
-    this.searches = this.searches.filter(s => !matched.has(s.id));
-  }
-
-  calculateDistance(a, b) {
-    const geoDist = a.avgLocation.distanceKm(b.avgLocation) / 20000;
-    const skillDist = Math.abs(a.avgSkillPercentile - b.avgSkillPercentile);
-    return this.config.weightGeo * geoDist + this.config.weightSkill * skillDist;
-  }
-
-  checkFeasibility(searches, playlistName) {
-    const skills = searches.map(s => s.avgSkillPercentile);
-    const skillRange = Math.max(...skills) - Math.min(...skills);
-
-    for (const s of searches) {
-      const waitTime = (this.currentTime - s.searchStartTime) * this.config.tickInterval;
-      const allowedRange = this.skillSimilarityBackoff(waitTime);
-      if (skillRange > allowedRange * 2) return false;
-    }
-
-    let commonDcs = new Set(searches[0].acceptableDcs);
-    for (const s of searches.slice(1)) {
-      commonDcs = new Set([...commonDcs].filter(dc => s.acceptableDcs.has(dc)));
-    }
-    
-    return commonDcs.size > 0;
-  }
-
-  balanceTeams(playerIds, playlistName) {
-    if (playlistName === 'FreeForAll') {
-      return playerIds.map(id => [id]);
-    }
-
-    const sorted = [...playerIds]
-      .map(id => ({ id, skill: this.players.get(id)?.skill || 0 }))
-      .sort((a, b) => b.skill - a.skill);
-
-    const teams = [[], []];
-    let forward = true;
-    let teamIdx = 0;
-
-    for (const { id } of sorted) {
-      teams[teamIdx].push(id);
-      if (forward) {
-        if (teamIdx === 1) forward = false;
-        else teamIdx++;
-      } else {
-        if (teamIdx === 0) forward = true;
-        else teamIdx--;
-      }
-    }
-
-    return teams;
-  }
-
-  processMatchCompletions() {
-    const completed = [];
-    
-    for (const [matchId, match] of this.matches) {
-      if (this.currentTime >= match.startTime + match.duration) {
-        completed.push(matchId);
-
-        const skillDiff = (match.teamSkills[0] || 0) - (match.teamSkills[1] || 0);
-        const pTeam0Wins = 1 / (1 + Math.exp(-2 * skillDiff));
-        const winningTeam = this.rng() < pTeam0Wins ? 0 : 1;
-        
-        // Blowout detection: consider both skill difference and win probability
-        // With balanced teams, skill differences are typically small (< 0.2)
-        const skillDiffAbs = Math.abs(skillDiff);
-        const winProbImbalance = Math.abs(pTeam0Wins - 0.5) * 2.0; // 0 to 1 scale
-        
-        let blowoutProb;
-        if (skillDiffAbs > 0.1) {
-          // Scale from 0.1 to 0.5 skill diff maps to 0.1 to 0.7 blowout probability
-          const skillComponent = Math.min((skillDiffAbs - 0.1) / 0.4, 1.0) * 0.4;
-          const imbalanceComponent = winProbImbalance * 0.3;
-          blowoutProb = Math.min(0.1 + skillComponent + imbalanceComponent, 0.9);
-        } else if (winProbImbalance > 0.4) {
-          // Even with small skill diff, high win probability imbalance suggests blowout risk
-          blowoutProb = winProbImbalance * 0.5;
-        } else {
-          // Small skill diff and balanced win probability - still possible but less likely
-          if (skillDiffAbs > 0.05) {
-            blowoutProb = 0.05 + winProbImbalance * 0.1;
-          } else {
-            blowoutProb = 0.02;
-          }
-        }
-        
-        const isBlowout = this.rng() < blowoutProb;
-
-        if (isBlowout) this.stats.blowoutCount++;
-
-        for (let teamIdx = 0; teamIdx < match.teams.length; teamIdx++) {
-          const won = teamIdx === winningTeam;
-          for (const pid of match.teams[teamIdx]) {
-            const p = this.players.get(pid);
-            if (!p) continue;
-
-            p.matchesPlayed++;
-            if (won) p.wins++;
-            else p.losses++;
-
-            p.recentBlowouts.push(isBlowout);
-            if (p.recentBlowouts.length > 10) p.recentBlowouts.shift();
-
-            p.currentMatch = null;
-
-            // Continue probability
-            const avgDeltaPing = p.recentDeltaPings.length > 0 
-              ? p.recentDeltaPings.reduce((a,b) => a+b, 0) / p.recentDeltaPings.length : 0;
-            const pingPenalty = Math.min(avgDeltaPing / 100, 0.2);
-            
-            const avgSearchTime = p.recentSearchTimes.length > 0
-              ? p.recentSearchTimes.reduce((a,b) => a+b, 0) / p.recentSearchTimes.length : 0;
-            const searchPenalty = Math.min(avgSearchTime / 120, 0.15);
-            
-            const blowoutRate = p.recentBlowouts.length > 0
-              ? p.recentBlowouts.filter(b => b).length / p.recentBlowouts.length : 0;
-            const blowoutPenalty = blowoutRate * 0.2;
-
-            const continueProb = Math.max(0.3, p.continuationProb - pingPenalty - searchPenalty - blowoutPenalty);
-
-            p.state = this.rng() < continueProb ? 'InLobby' : 'Offline';
-          }
-        }
-
-        // Release server
-        const dc = this.dcServers.find(d => d.id === match.dcId);
-        if (dc) dc.busy[match.playlist] = Math.max(0, (dc.busy[match.playlist] || 0) - 1);
-      }
-    }
-
-    completed.forEach(id => this.matches.delete(id));
-  }
-
-  updateStats() {
-    const playersByState = { Offline: 0, InLobby: 0, Searching: 0, InMatch: 0 };
-    for (const p of this.players.values()) {
-      playersByState[p.state]++;
-    }
-
-    const timePoint = {
-      time: this.currentTime * this.config.tickInterval,
-      searching: playersByState.Searching,
-      inMatch: playersByState.InMatch,
-      inLobby: playersByState.InLobby,
-      activeMatches: this.matches.size,
-      avgSearchTime: this.getAvgSearchTime(),
-      avgDeltaPing: this.getAvgDeltaPing(),
-    };
-
-    this.stats.timeSeriesData.push(timePoint);
-    if (this.stats.timeSeriesData.length > 200) {
-      this.stats.timeSeriesData.shift();
-    }
-  }
-
-  poissonSample(lambda) {
-    const L = Math.exp(-lambda);
-    let k = 0, p = 1;
-    do {
-      k++;
-      p *= this.rng();
-    } while (p > L);
-    return k - 1;
-  }
-
-  getAvgSearchTime() {
-    const samples = this.stats.searchTimeSamples.slice(-100);
-    return samples.length > 0 ? samples.reduce((a,b) => a+b, 0) / samples.length : 0;
-  }
-
-  getAvgDeltaPing() {
-    const samples = this.stats.deltaPingSamples.slice(-100);
-    return samples.length > 0 ? samples.reduce((a,b) => a+b, 0) / samples.length : 0;
-  }
-
-  getPercentile(arr, p) {
-    if (arr.length === 0) return 0;
-    const sorted = [...arr].sort((a,b) => a - b);
-    const idx = Math.floor(sorted.length * p);
-    return sorted[Math.min(idx, sorted.length - 1)];
-  }
-
-  getStats() {
-    const playersByState = { Offline: 0, InLobby: 0, Searching: 0, InMatch: 0 };
-    for (const p of this.players.values()) {
-      playersByState[p.state]++;
-    }
-
-    const searchTimes = this.stats.searchTimeSamples.slice(-1000);
-    const deltaPings = this.stats.deltaPingSamples.slice(-1000);
-    const skillDisparities = this.stats.skillDisparitySamples.slice(-1000);
-
-    return {
-      currentTime: this.currentTime,
-      timeElapsed: this.currentTime * this.config.tickInterval,
-      totalPlayers: this.players.size,
-      ...playersByState,
-      activeMatches: this.matches.size,
-      totalMatches: this.stats.totalMatches,
-      avgSearchTime: searchTimes.length > 0 ? searchTimes.reduce((a,b) => a+b, 0) / searchTimes.length : 0,
-      searchTimeP50: this.getPercentile(searchTimes, 0.5),
-      searchTimeP90: this.getPercentile(searchTimes, 0.9),
-      avgDeltaPing: deltaPings.length > 0 ? deltaPings.reduce((a,b) => a+b, 0) / deltaPings.length : 0,
-      deltaPingP90: this.getPercentile(deltaPings, 0.9),
-      avgSkillDisparity: skillDisparities.length > 0 ? skillDisparities.reduce((a,b) => a+b, 0) / skillDisparities.length : 0,
-      blowoutRate: this.stats.totalMatches > 0 ? this.stats.blowoutCount / this.stats.totalMatches : 0,
-      timeSeriesData: this.stats.timeSeriesData,
-    };
-  }
-
-  getBucketStats() {
-    const buckets = {};
-    for (let b = 1; b <= this.config.numSkillBuckets; b++) {
-      buckets[b] = { bucket: b, players: 0, avgSearchTime: 0, avgDeltaPing: 0, winRate: 0, matches: 0 };
-    }
-
-    for (const p of this.players.values()) {
-      const b = buckets[p.skillBucket];
-      if (!b) continue;
-      b.players++;
-      if (p.recentSearchTimes.length > 0) {
-        b.avgSearchTime += p.recentSearchTimes.reduce((a,c) => a+c, 0) / p.recentSearchTimes.length;
-      }
-      if (p.recentDeltaPings.length > 0) {
-        b.avgDeltaPing += p.recentDeltaPings.reduce((a,c) => a+c, 0) / p.recentDeltaPings.length;
-      }
-      b.matches += p.matchesPlayed;
-      if (p.matchesPlayed > 0) {
-        b.winRate += p.wins / p.matchesPlayed;
-      }
-    }
-
-    for (const b of Object.values(buckets)) {
-      if (b.players > 0) {
-        b.avgSearchTime /= b.players;
-        b.avgDeltaPing /= b.players;
-        b.winRate /= b.players;
-      }
-    }
-
-    return Object.values(buckets);
-  }
-
-  getSkillDistribution() {
-    const bins = new Array(20).fill(0);
-    for (const p of this.players.values()) {
-      const idx = Math.min(19, Math.floor((p.skill + 1) / 2 * 20));
-      bins[idx]++;
-    }
-    return bins.map((count, i) => ({
-      skill: ((i / 19) * 2 - 1).toFixed(2),
-      count,
-    }));
-  }
-
-  getSearchTimeHistogram() {
-    const samples = this.stats.searchTimeSamples.slice(-500);
-    if (samples.length === 0) return [];
-    
-    const max = Math.max(...samples);
-    const binWidth = Math.max(5, max / 15);
-    const bins = new Array(15).fill(0);
-    
-    for (const s of samples) {
-      const idx = Math.min(14, Math.floor(s / binWidth));
-      bins[idx]++;
-    }
-    
-    return bins.map((count, i) => ({
-      range: `${(i * binWidth).toFixed(0)}-${((i+1) * binWidth).toFixed(0)}s`,
-      count,
-    }));
-  }
-
-  getDeltaPingHistogram() {
-    const samples = this.stats.deltaPingSamples.slice(-500);
-    if (samples.length === 0) return [];
-    
-    const max = Math.max(...samples, 1);
-    const binWidth = Math.max(5, max / 12);
-    const bins = new Array(12).fill(0);
-    
-    for (const s of samples) {
-      const idx = Math.min(11, Math.floor(s / binWidth));
-      bins[idx]++;
-    }
-    
-    return bins.map((count, i) => ({
-      range: `${(i * binWidth).toFixed(0)}-${((i+1) * binWidth).toFixed(0)}ms`,
-      count,
-    }));
-  }
-}
 
 // ============================================================================
 // REACT COMPONENTS
@@ -727,34 +98,136 @@ export default function MatchmakingSimulator() {
   const [population, setPopulation] = useState(5000);
   const [activeTab, setActiveTab] = useState('overview');
   const [experimentResults, setExperimentResults] = useState(null);
+  const [wasmReady, setWasmReady] = useState(false);
+  const [wasmError, setWasmError] = useState(null);
+  const [parties, setParties] = useState([]);
   const animationRef = useRef(null);
 
+  // Initialize WASM on mount
+  useEffect(() => {
+    let mounted = true;
+    init()
+      .then(() => {
+        if (mounted) {
+          setWasmReady(true);
+          setWasmError(null);
+        }
+      })
+      .catch((err) => {
+        console.error('Failed to initialize WASM:', err);
+        if (mounted) {
+          setWasmError(err.message);
+          setWasmReady(false);
+        }
+      });
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  // Convert JS config to Rust config format
+  const convertConfigToRust = useCallback((jsConfig) => {
+    return {
+      max_ping: jsConfig.maxPing,
+      delta_ping_initial: jsConfig.deltaPingInitial,
+      delta_ping_rate: jsConfig.deltaPingRate,
+      delta_ping_max: jsConfig.deltaPingMax,
+      skill_similarity_initial: jsConfig.skillSimilarityInitial,
+      skill_similarity_rate: jsConfig.skillSimilarityRate,
+      skill_similarity_max: jsConfig.skillSimilarityMax,
+      max_skill_disparity_initial: jsConfig.maxSkillDisparityInitial,
+      max_skill_disparity_rate: jsConfig.maxSkillDisparityRate,
+      max_skill_disparity_max: jsConfig.maxSkillDisparityMax,
+      weight_geo: jsConfig.weightGeo,
+      weight_skill: jsConfig.weightSkill,
+      weight_input: jsConfig.weightInput,
+      weight_platform: jsConfig.weightPlatform,
+      party_player_fraction: jsConfig.partyPlayerFraction ?? 0.5,
+      quality_weight_ping: 0.4,
+      quality_weight_skill_balance: 0.4,
+      quality_weight_wait_time: 0.2,
+      tick_interval: jsConfig.tickInterval,
+      num_skill_buckets: jsConfig.numSkillBuckets,
+      top_k_candidates: jsConfig.topKCandidates,
+    };
+  }, []);
+
   const initSimulation = useCallback(() => {
-    console.log(`Initializing simulation with population: ${population}`);
-    // Scale arrival rate with population (roughly 0.2% of population per tick, min 10, max 2000)
-    // This ensures larger populations have proportionally more players coming online
-    const scaledArrivalRate = Math.max(10, Math.min(2000, Math.round(population * 0.002)));
-    const adjustedConfig = { ...config, arrivalRate: scaledArrivalRate };
-    console.log(`Scaled arrival rate to: ${scaledArrivalRate} players/tick (${(scaledArrivalRate / population * 100).toFixed(3)}% of population)`);
-    const newSim = new SimulationEngine(adjustedConfig, Date.now());
-    newSim.generatePopulation(population);
-    const stats = newSim.getStats();
-    console.log(`Simulation initialized. Total players: ${stats.totalPlayers}, Arrival rate: ${scaledArrivalRate}/tick`);
-    setSim(newSim);
-    setStats(stats);
-    setRunning(false);
-    if (animationRef.current) cancelAnimationFrame(animationRef.current);
-  }, [config, population]);
+    if (!wasmReady) {
+      console.log('WASM not ready yet, waiting...');
+      return;
+    }
+
+    try {
+      console.log(`Initializing simulation with population: ${population}`);
+      // Scale arrival rate with population (roughly 0.2% of population per tick, min 10, max 2000)
+      const scaledArrivalRate = Math.max(10, Math.min(2000, Math.round(population * 0.002)));
+      const adjustedConfig = { ...config, arrivalRate: scaledArrivalRate };
+      console.log(`Scaled arrival rate to: ${scaledArrivalRate} players/tick`);
+      
+      // Create WASM simulation
+      const rustConfig = convertConfigToRust(adjustedConfig);
+      const newSim = new SimulationEngine(BigInt(Date.now()));
+      newSim.update_config(JSON.stringify(rustConfig));
+      newSim.generate_population(population);
+      newSim.set_arrival_rate(scaledArrivalRate);
+      
+      // Get initial stats
+      const statsJson = newSim.get_stats();
+      const rawStats = JSON.parse(statsJson);
+      // Map Rust field names to JS field names for compatibility
+      const stats = {
+        currentTime: rawStats.ticks,
+        timeElapsed: rawStats.time_elapsed,
+        totalPlayers: rawStats.players_offline + rawStats.players_in_lobby + rawStats.players_searching + rawStats.players_in_match,
+        Offline: rawStats.players_offline,
+        InLobby: rawStats.players_in_lobby,
+        Searching: rawStats.players_searching,
+        InMatch: rawStats.players_in_match,
+        activeMatches: rawStats.active_matches,
+        totalMatches: rawStats.total_matches,
+        avgSearchTime: rawStats.avg_search_time,
+        searchTimeP50: rawStats.search_time_p50,
+        searchTimeP90: rawStats.search_time_p90,
+        searchTimeP99: rawStats.search_time_p99,
+        avgDeltaPing: rawStats.avg_delta_ping,
+        deltaPingP50: rawStats.delta_ping_p50,
+        deltaPingP90: rawStats.delta_ping_p90,
+        avgSkillDisparity: rawStats.avg_skill_disparity,
+        blowoutRate: rawStats.blowout_rate,
+        // Party metrics
+        partyCount: rawStats.party_count || 0,
+        avgPartySize: rawStats.avg_party_size || 0,
+        partyMatchCount: rawStats.party_match_count || 0,
+        soloMatchCount: rawStats.solo_match_count || 0,
+        partySearchTimes: rawStats.party_search_times || [],
+        soloSearchTimes: rawStats.solo_search_times || [],
+        // Time series data
+        timeSeriesData: [],
+      };
+      console.log(`Simulation initialized. Total players: ${stats.totalPlayers}, Arrival rate: ${scaledArrivalRate}/tick`);
+      
+      setSim(newSim);
+      setStats(stats);
+      setRunning(false);
+      if (animationRef.current) cancelAnimationFrame(animationRef.current);
+    } catch (error) {
+      console.error('Failed to initialize simulation:', error);
+      setWasmError(error.message);
+    }
+  }, [config, population, wasmReady, convertConfigToRust]);
 
   useEffect(() => {
-    initSimulation();
+    if (wasmReady) {
+      initSimulation();
+    }
     return () => {
       if (animationRef.current) cancelAnimationFrame(animationRef.current);
     };
-  }, [initSimulation]);
+  }, [initSimulation, wasmReady]);
 
   useEffect(() => {
-    if (!running || !sim) return;
+    if (!running || !sim || !wasmReady) return;
 
     let lastTime = performance.now();
     const ticksPerFrame = speed;
@@ -762,10 +235,66 @@ export default function MatchmakingSimulator() {
     const animate = (now) => {
       const delta = now - lastTime;
       if (delta >= 50) {
-        for (let i = 0; i < ticksPerFrame; i++) {
-          sim.tick();
+        try {
+          for (let i = 0; i < ticksPerFrame; i++) {
+            sim.tick();
+          }
+          const statsJson = sim.get_stats();
+          const rawStats = JSON.parse(statsJson);
+          // Get previous stats for time series
+          setStats(prevStats => {
+            // Map Rust field names to JS field names for compatibility
+            const newStats = {
+              currentTime: rawStats.ticks,
+              timeElapsed: rawStats.time_elapsed,
+              totalPlayers: rawStats.players_offline + rawStats.players_in_lobby + rawStats.players_searching + rawStats.players_in_match,
+              Offline: rawStats.players_offline,
+              InLobby: rawStats.players_in_lobby,
+              Searching: rawStats.players_searching,
+              InMatch: rawStats.players_in_match,
+              activeMatches: rawStats.active_matches,
+              totalMatches: rawStats.total_matches,
+              avgSearchTime: rawStats.avg_search_time,
+              searchTimeP50: rawStats.search_time_p50,
+              searchTimeP90: rawStats.search_time_p90,
+              searchTimeP99: rawStats.search_time_p99,
+              avgDeltaPing: rawStats.avg_delta_ping,
+              deltaPingP50: rawStats.delta_ping_p50,
+              deltaPingP90: rawStats.delta_ping_p90,
+              avgSkillDisparity: rawStats.avg_skill_disparity,
+              blowoutRate: rawStats.blowout_rate,
+              // Party metrics
+              partyCount: rawStats.party_count || 0,
+              avgPartySize: rawStats.avg_party_size || 0,
+              partyMatchCount: rawStats.party_match_count || 0,
+              soloMatchCount: rawStats.solo_match_count || 0,
+              partySearchTimes: rawStats.party_search_times || [],
+              soloSearchTimes: rawStats.solo_search_times || [],
+              // Time series data (preserve from previous or initialize)
+              timeSeriesData: prevStats?.timeSeriesData || [],
+            };
+            // Update time series
+            if (newStats.timeSeriesData.length === 0 || newStats.timeSeriesData[newStats.timeSeriesData.length - 1].time !== newStats.timeElapsed) {
+              newStats.timeSeriesData.push({
+                time: newStats.timeElapsed,
+                searching: newStats.Searching,
+                inMatch: newStats.InMatch,
+                inLobby: newStats.InLobby,
+                activeMatches: newStats.activeMatches,
+                avgSearchTime: newStats.avgSearchTime,
+                avgDeltaPing: newStats.avgDeltaPing,
+              });
+              if (newStats.timeSeriesData.length > 200) {
+                newStats.timeSeriesData.shift();
+              }
+            }
+            return newStats;
+          });
+        } catch (error) {
+          console.error('Error during simulation tick:', error);
+          setWasmError(error.message);
+          setRunning(false);
         }
-        setStats(sim.getStats());
         lastTime = now;
       }
       animationRef.current = requestAnimationFrame(animate);
@@ -775,16 +304,32 @@ export default function MatchmakingSimulator() {
     return () => {
       if (animationRef.current) cancelAnimationFrame(animationRef.current);
     };
-  }, [running, sim, speed]);
+  }, [running, sim, speed, wasmReady]);
 
   const runExperiment = (paramName, values) => {
+    if (!wasmReady) {
+      console.error('WASM not ready for experiments');
+      return;
+    }
+    
     const results = [];
     for (const value of values) {
       const testConfig = { ...config, [paramName]: value };
-      const testSim = new SimulationEngine(testConfig, 42);
-      testSim.generatePopulation(population);
+      const rustConfig = convertConfigToRust(testConfig);
+      const testSim = new SimulationEngine(BigInt(42));
+      testSim.update_config(JSON.stringify(rustConfig));
+      testSim.generate_population(population);
       for (let i = 0; i < 500; i++) testSim.tick();
-      const s = testSim.getStats();
+      
+      const statsJson = testSim.get_stats();
+      const rawStats = JSON.parse(statsJson);
+      const s = {
+        avgSearchTime: rawStats.avg_search_time,
+        avgDeltaPing: rawStats.avg_delta_ping,
+        avgSkillDisparity: rawStats.avg_skill_disparity,
+        blowoutRate: rawStats.blowout_rate,
+      };
+      
       results.push({
         value,
         avgSearchTime: s.avgSearchTime,
@@ -801,7 +346,24 @@ export default function MatchmakingSimulator() {
       const newConfig = { ...prev, [key]: parseFloat(value) };
       // If arrival rate is being updated manually, don't auto-scale it
       if (key === 'arrivalRate') {
+        // Update WASM sim if it exists
+        if (sim && wasmReady) {
+          try {
+            sim.set_arrival_rate(parseFloat(value));
+          } catch (error) {
+            console.error('Failed to update arrival rate:', error);
+          }
+        }
         return newConfig;
+      }
+      // Update WASM sim config
+      if (sim && wasmReady) {
+        try {
+          const rustConfig = convertConfigToRust(newConfig);
+          sim.update_config(JSON.stringify(rustConfig));
+        } catch (error) {
+          console.error('Failed to update config:', error);
+        }
       }
       return newConfig;
     });
@@ -813,12 +375,89 @@ export default function MatchmakingSimulator() {
     return mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
   };
 
+  // Refresh parties list
+  const refreshParties = useCallback(() => {
+    if (!sim || !wasmReady) return;
+    try {
+      const partiesJson = sim.get_parties();
+      const partiesList = JSON.parse(partiesJson);
+      setParties(partiesList);
+    } catch (error) {
+      console.error('Error refreshing parties:', error);
+    }
+  }, [sim, wasmReady]);
+
+  // Refresh parties when stats update (with debouncing to avoid recursive errors)
+  useEffect(() => {
+    if (sim && wasmReady && stats) {
+      // Use setTimeout to avoid calling during active simulation ticks
+      const timeoutId = setTimeout(() => {
+        try {
+          refreshParties();
+        } catch (error) {
+          console.error('Error in parties refresh effect:', error);
+        }
+      }, 100);
+      return () => clearTimeout(timeoutId);
+    }
+  }, [sim, wasmReady, stats, refreshParties]);
+
+  // Loading/error states
+  if (!wasmReady && !wasmError) {
+    return <div style={{ background: COLORS.dark, minHeight: '100vh', color: COLORS.text, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: '1rem' }}>
+      <div>Loading WASM module...</div>
+      <div style={{ fontSize: '0.75rem', color: COLORS.textMuted }}>Initializing Rust simulation engine</div>
+    </div>;
+  }
+
+  if (wasmError) {
+    return <div style={{ background: COLORS.dark, minHeight: '100vh', color: COLORS.text, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: '1rem' }}>
+      <div style={{ color: COLORS.danger }}>WASM Error: {wasmError}</div>
+      <button onClick={() => window.location.reload()} style={{ padding: '0.5rem 1rem', background: COLORS.primary, border: 'none', borderRadius: '4px', color: COLORS.dark, cursor: 'pointer' }}>
+        Reload Page
+      </button>
+    </div>;
+  }
+
   if (!stats) return <div style={{ background: COLORS.dark, minHeight: '100vh', color: COLORS.text, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>Loading simulation...</div>;
 
-  const bucketStats = sim?.getBucketStats() || [];
-  const skillDist = sim?.getSkillDistribution() || [];
-  const searchTimeHist = sim?.getSearchTimeHistogram() || [];
-  const deltaPingHist = sim?.getDeltaPingHistogram() || [];
+  // Get stats data from WASM
+  let bucketStats = [];
+  let skillDist = [];
+  let searchTimeHist = [];
+  let deltaPingHist = [];
+  
+  if (sim && wasmReady) {
+    try {
+      const bucketStatsJson = sim.get_bucket_stats();
+      bucketStats = JSON.parse(bucketStatsJson);
+      bucketStats = Object.values(bucketStats).map(b => ({
+        bucket: b.bucket_id,
+        players: b.player_count,
+        avgSearchTime: b.avg_search_time,
+        avgDeltaPing: b.avg_delta_ping,
+        winRate: b.win_rate,
+        matches: b.matches_played,
+      }));
+
+      const skillDistJson = sim.get_skill_distribution();
+      skillDist = JSON.parse(skillDistJson).map(([skill, count]) => ({ skill: skill.toFixed(2), count }));
+
+      const searchTimeHistJson = sim.get_search_time_histogram(15);
+      searchTimeHist = JSON.parse(searchTimeHistJson).map(bin => ({
+        range: `${bin.bin_start.toFixed(0)}-${bin.bin_end.toFixed(0)}s`,
+        count: bin.count,
+      }));
+
+      const deltaPingHistJson = sim.get_delta_ping_histogram(12);
+      deltaPingHist = JSON.parse(deltaPingHistJson).map(bin => ({
+        range: `${bin.bin_start.toFixed(0)}-${bin.bin_end.toFixed(0)}ms`,
+        count: bin.count,
+      }));
+    } catch (error) {
+      console.error('Error getting stats data:', error);
+    }
+  }
 
   return (
     <div style={{ 
@@ -955,10 +594,14 @@ export default function MatchmakingSimulator() {
               ['deltaPingRate', 'Ping Backoff Rate', 0, 10],
               ['weightSkill', 'Skill Weight', 0, 1],
               ['weightGeo', 'Geo Weight', 0, 1],
+            ['partyPlayerFraction', 'Party Player Fraction', 0, 1],
               ['arrivalRate', 'Arrival Rate (auto-scaled)', 1, 2000],
             ].map(([key, label, min, max]) => (
               <label key={key} style={{ display: 'block', marginBottom: '0.5rem' }}>
-                <span style={{ fontSize: '0.65rem', color: COLORS.textMuted }}>{label}: {config[key].toFixed(2)}</span>
+              <span style={{ fontSize: '0.65rem', color: COLORS.textMuted }}>
+                {label}: {config[key].toFixed(2)}
+                {key === 'partyPlayerFraction' && ' (0 = all solo, 1 = all in parties)'}
+              </span>
                 <input
                   type="range"
                   min={min}
@@ -1006,6 +649,7 @@ export default function MatchmakingSimulator() {
               Sweep: Skill vs Ping Weight
             </button>
           </div>
+
         </aside>
 
         {/* Main Content */}
@@ -1078,6 +722,134 @@ export default function MatchmakingSimulator() {
                 ))}
               </div>
 
+              {/* Party Metrics Section */}
+              {(stats.partyCount !== undefined || stats.partyMatchCount !== undefined) && (
+                <div style={{ 
+                  background: COLORS.card, 
+                  border: `1px solid ${COLORS.border}`, 
+                  borderRadius: '8px', 
+                  padding: '1rem',
+                  marginBottom: '1rem',
+                }}>
+                  <h4 style={{ fontSize: '0.75rem', color: COLORS.textMuted, marginBottom: '0.75rem', letterSpacing: '0.1em' }}>PARTY STATISTICS</h4>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '0.75rem' }}>
+                    {[
+                      { label: 'Active Parties', value: stats.partyCount || 0, color: COLORS.primary },
+                      { label: 'Avg Party Size', value: stats.avgPartySize ? stats.avgPartySize.toFixed(1) : '0.0', color: COLORS.tertiary },
+                      { label: 'Party Matches', value: stats.partyMatchCount || 0, color: COLORS.success, sub: stats.totalMatches ? `${((stats.partyMatchCount || 0) / stats.totalMatches * 100).toFixed(1)}%` : '0%' },
+                      { label: 'Solo Matches', value: stats.soloMatchCount || 0, color: COLORS.warning, sub: stats.totalMatches ? `${((stats.soloMatchCount || 0) / stats.totalMatches * 100).toFixed(1)}%` : '0%' },
+                    ].map(({ label, value, color, sub }) => (
+                      <div key={label} style={{
+                        background: COLORS.darker,
+                        border: `1px solid ${COLORS.border}`,
+                        borderRadius: '6px',
+                        padding: '0.75rem',
+                      }}>
+                        <div style={{ fontSize: '0.6rem', color: COLORS.textMuted, marginBottom: '0.25rem' }}>{label}</div>
+                        <div style={{ fontSize: '1.1rem', fontWeight: 600, color }}>{value}</div>
+                        {sub && <div style={{ fontSize: '0.55rem', color: COLORS.textMuted, marginTop: '0.25rem' }}>{sub}</div>}
+                      </div>
+                    ))}
+                  </div>
+                  {(stats.partySearchTimes && stats.partySearchTimes.length > 0) && (
+                    <div style={{ marginTop: '0.75rem', fontSize: '0.65rem', color: COLORS.textMuted }}>
+                      Avg Party Search Time: {(stats.partySearchTimes.reduce((a, b) => a + b, 0) / stats.partySearchTimes.length).toFixed(1)}s
+                      {stats.soloSearchTimes && stats.soloSearchTimes.length > 0 && (
+                        <span style={{ marginLeft: '1rem' }}>
+                          Avg Solo Search Time: {(stats.soloSearchTimes.reduce((a, b) => a + b, 0) / stats.soloSearchTimes.length).toFixed(1)}s
+                        </span>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Search Queue Visualization */}
+              {(() => {
+                let searchQueue = [];
+                if (sim && wasmReady) {
+                  try {
+                    const queueJson = sim.get_search_queue();
+                    searchQueue = JSON.parse(queueJson);
+                  } catch (error) {
+                    console.error('Error getting search queue:', error);
+                  }
+                }
+                const partySearches = searchQueue.filter(s => s.is_party);
+                const soloSearches = searchQueue.filter(s => !s.is_party);
+
+                return (
+                  <div style={{ 
+                    background: COLORS.card, 
+                    border: `1px solid ${COLORS.border}`, 
+                    borderRadius: '8px', 
+                    padding: '1rem',
+                    marginBottom: '1rem',
+                  }}>
+                    <h4 style={{ fontSize: '0.75rem', color: COLORS.textMuted, marginBottom: '0.75rem', letterSpacing: '0.1em' }}>SEARCH QUEUE</h4>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem', marginBottom: '0.75rem' }}>
+                      <div style={{ background: COLORS.darker, padding: '0.5rem', borderRadius: '4px' }}>
+                        <div style={{ fontSize: '0.65rem', color: COLORS.textMuted }}>Party Searches</div>
+                        <div style={{ fontSize: '1.25rem', fontWeight: 600, color: COLORS.success }}>{partySearches.length}</div>
+                        {partySearches.length > 0 && (
+                          <div style={{ fontSize: '0.6rem', color: COLORS.textMuted, marginTop: '0.25rem' }}>
+                            Avg size: {(partySearches.reduce((sum, s) => sum + s.size, 0) / partySearches.length).toFixed(1)}
+                          </div>
+                        )}
+                      </div>
+                      <div style={{ background: COLORS.darker, padding: '0.5rem', borderRadius: '4px' }}>
+                        <div style={{ fontSize: '0.65rem', color: COLORS.textMuted }}>Solo Searches</div>
+                        <div style={{ fontSize: '1.25rem', fontWeight: 600, color: COLORS.warning }}>{soloSearches.length}</div>
+                      </div>
+                    </div>
+                    {searchQueue.length > 0 && (
+                      <div style={{ maxHeight: '150px', overflowY: 'auto' }}>
+                        {searchQueue.slice(0, 10).map(search => (
+                          <div
+                            key={search.id}
+                            style={{
+                              padding: '0.5rem',
+                              marginBottom: '0.25rem',
+                              background: COLORS.darker,
+                              border: `1px solid ${search.is_party ? COLORS.success : COLORS.border}`,
+                              borderRadius: '4px',
+                              fontSize: '0.65rem',
+                              display: 'flex',
+                              justifyContent: 'space-between',
+                              alignItems: 'center',
+                            }}
+                          >
+                            <div>
+                              <span style={{ 
+                                color: search.is_party ? COLORS.success : COLORS.textMuted,
+                                fontWeight: 600,
+                                marginRight: '0.5rem',
+                              }}>
+                                {search.is_party ? '👥 Party' : '👤 Solo'}
+                              </span>
+                              <span style={{ color: COLORS.text }}>Size: {search.size}</span>
+                            </div>
+                            <div style={{ color: COLORS.textMuted }}>
+                              {search.wait_time.toFixed(1)}s
+                            </div>
+                          </div>
+                        ))}
+                        {searchQueue.length > 10 && (
+                          <div style={{ fontSize: '0.6rem', color: COLORS.textMuted, textAlign: 'center', padding: '0.25rem' }}>
+                            +{searchQueue.length - 10} more searches
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    {searchQueue.length === 0 && (
+                      <div style={{ fontSize: '0.65rem', color: COLORS.textMuted, textAlign: 'center', padding: '0.5rem' }}>
+                        No active searches
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+
               {/* Time Series Charts */}
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem' }}>
                 <div style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: '8px', padding: '1rem' }}>
@@ -1113,7 +885,63 @@ export default function MatchmakingSimulator() {
 
           {/* Distributions Tab */}
           {activeTab === 'distributions' && (
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem' }}>
+            <div>
+              {/* Party Visualizations */}
+              {parties.length > 0 && (
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem', marginBottom: '0.75rem' }}>
+                  <div style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: '8px', padding: '1rem' }}>
+                    <h4 style={{ fontSize: '0.75rem', color: COLORS.textMuted, marginBottom: '0.5rem' }}>PARTY SIZE DISTRIBUTION</h4>
+                    <ResponsiveContainer width="100%" height={200}>
+                      <BarChart data={(() => {
+                        const sizeCounts = {};
+                        parties.forEach(p => {
+                          sizeCounts[p.size] = (sizeCounts[p.size] || 0) + 1;
+                        });
+                        return Object.entries(sizeCounts).map(([size, count]) => ({
+                          size: `${size} players`,
+                          count,
+                        })).sort((a, b) => {
+                          const aSize = parseInt(a.size);
+                          const bSize = parseInt(b.size);
+                          return aSize - bSize;
+                        });
+                      })()}>
+                        <CartesianGrid strokeDasharray="3 3" stroke={COLORS.border} />
+                        <XAxis dataKey="size" tick={{ fill: COLORS.textMuted, fontSize: 9 }} />
+                        <YAxis tick={{ fill: COLORS.textMuted, fontSize: 10 }} />
+                        <Tooltip contentStyle={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }} />
+                        <Bar dataKey="count" fill={COLORS.primary} radius={[2, 2, 0, 0]} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+
+                  <div style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: '8px', padding: '1rem' }}>
+                    <h4 style={{ fontSize: '0.75rem', color: COLORS.textMuted, marginBottom: '0.5rem' }}>PARTY VS SOLO SEARCH TIMES</h4>
+                    <ResponsiveContainer width="100%" height={200}>
+                      <BarChart data={[
+                        { type: 'Party', avg: stats.partySearchTimes && stats.partySearchTimes.length > 0 
+                          ? stats.partySearchTimes.reduce((a, b) => a + b, 0) / stats.partySearchTimes.length
+                          : 0 },
+                        { type: 'Solo', avg: stats.soloSearchTimes && stats.soloSearchTimes.length > 0
+                          ? stats.soloSearchTimes.reduce((a, b) => a + b, 0) / stats.soloSearchTimes.length
+                          : 0 },
+                      ]}>
+                        <CartesianGrid strokeDasharray="3 3" stroke={COLORS.border} />
+                        <XAxis dataKey="type" tick={{ fill: COLORS.textMuted, fontSize: 10 }} />
+                        <YAxis tick={{ fill: COLORS.textMuted, fontSize: 10 }} label={{ value: 'Avg Search Time (s)', angle: -90, position: 'insideLeft', fill: COLORS.textMuted }} />
+                        <Tooltip contentStyle={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }} formatter={(v) => `${Number(v).toFixed(1)}s`} />
+                        <Bar dataKey="avg" radius={[2, 2, 0, 0]}>
+                          {[COLORS.success, COLORS.warning].map((color, i) => (
+                            <Cell key={i} fill={color} />
+                          ))}
+                        </Bar>
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+              )}
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem' }}>
               <div style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: '8px', padding: '1rem' }}>
                 <h4 style={{ fontSize: '0.75rem', color: COLORS.textMuted, marginBottom: '0.5rem' }}>SKILL DISTRIBUTION</h4>
                 <ResponsiveContainer width="100%" height={250}>
@@ -1173,6 +1001,7 @@ export default function MatchmakingSimulator() {
                     </Bar>
                   </BarChart>
                 </ResponsiveContainer>
+              </div>
               </div>
             </div>
           )}
@@ -1299,6 +1128,7 @@ export default function MatchmakingSimulator() {
           )}
         </main>
       </div>
+
     </div>
   );
 }

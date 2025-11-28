@@ -191,6 +191,99 @@ impl SimulationEngine {
             .collect();
         serde_json::to_string(&dc_info).unwrap_or_default()
     }
+
+    /// Create a party from player IDs
+    pub fn create_party(&mut self, player_ids_json: &str) -> Result<String, JsValue> {
+        let player_ids: Vec<usize> = serde_json::from_str(player_ids_json)
+            .map_err(|e| JsValue::from_str(&format!("Player IDs parse error: {}", e)))?;
+        
+        match self.sim.create_party(player_ids) {
+            Ok(party_id) => Ok(serde_json::json!({ "party_id": party_id }).to_string()),
+            Err(e) => Err(JsValue::from_str(&e)),
+        }
+    }
+
+    /// Join a player to a party
+    pub fn join_party(&mut self, party_id: usize, player_id: usize) -> Result<(), JsValue> {
+        self.sim.join_party(party_id, player_id)
+            .map_err(|e| JsValue::from_str(&e))
+    }
+
+    /// Leave a party
+    pub fn leave_party(&mut self, party_id: usize, player_id: usize) -> Result<(), JsValue> {
+        self.sim.leave_party(party_id, player_id)
+            .map_err(|e| JsValue::from_str(&e))
+    }
+
+    /// Disband a party
+    pub fn disband_party(&mut self, party_id: usize) -> Result<(), JsValue> {
+        self.sim.disband_party(party_id)
+            .map_err(|e| JsValue::from_str(&e))
+    }
+
+    /// Get all parties as JSON
+    pub fn get_parties(&self) -> String {
+        let parties: Vec<_> = self.sim.parties.iter()
+            .map(|(id, party)| {
+                serde_json::json!({
+                    "id": id,
+                    "player_ids": party.player_ids,
+                    "leader_id": party.leader_id,
+                    "size": party.size(),
+                    "avg_skill": party.avg_skill,
+                    "avg_skill_percentile": party.avg_skill_percentile,
+                    "skill_disparity": party.skill_disparity,
+                })
+            })
+            .collect();
+        serde_json::to_string(&parties).unwrap_or_default()
+    }
+
+    /// Get party members
+    pub fn get_party_members(&self, party_id: usize) -> String {
+        let members = self.sim.get_party_members(party_id);
+        serde_json::to_string(&members).unwrap_or_default()
+    }
+
+    /// Get players in lobby (for party creation UI)
+    pub fn get_lobby_players(&self) -> String {
+        let lobby_players: Vec<_> = self.sim.players.iter()
+            .filter(|(_, p)| p.state == PlayerState::InLobby)
+            .map(|(id, p)| {
+                serde_json::json!({
+                    "id": id,
+                    "skill": p.skill,
+                    "skill_percentile": p.skill_percentile,
+                    "party_id": p.party_id,
+                })
+            })
+            .collect();
+        serde_json::to_string(&lobby_players).unwrap_or_default()
+    }
+
+    /// Get active search objects (for search queue visualization)
+    pub fn get_search_queue(&self) -> String {
+        let searches: Vec<_> = self.sim.searches.iter()
+            .map(|s| {
+                // Check if this is a party search by checking if any player has a party_id
+                let is_party = s.player_ids.iter().any(|&pid| {
+                    self.sim.players.get(&pid)
+                        .map(|p| p.party_id.is_some())
+                        .unwrap_or(false)
+                });
+                
+                serde_json::json!({
+                    "id": s.id,
+                    "player_ids": s.player_ids,
+                    "size": s.size(),
+                    "is_party": is_party,
+                    "avg_skill_percentile": s.avg_skill_percentile,
+                    "wait_time": (self.sim.current_time - s.search_start_time) as f64 * self.sim.config.tick_interval,
+                })
+            })
+            .collect();
+        serde_json::to_string(&searches).unwrap_or_default()
+    }
 }
 
 /// Run a parameter sweep experiment
