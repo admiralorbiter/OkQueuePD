@@ -138,30 +138,29 @@ const runExperiment = (paramName, values) => {
 };
 ```
 
-## 🧮 Mathematical Model
+## 📚 Documentation
 
-The simulation implements the model from your specification:
+- **[Whitepaper](cod_matchmaking_model.md)**: Full mathematical model specification
+- **[Implementation Roadmap](COD_MM_ROADMAP.md)**: Detailed plan for completing the whitepaper implementation in vertical slices
 
-### Player State Machine
-```
-OFFLINE → IN_LOBBY → SEARCHING → IN_MATCH → (IN_LOBBY | OFFLINE)
-```
+### Model Overview
 
-### Distance Metric
-```
-D(j,k) = α_geo·d_geo + α_skill·d_skill + α_input·d_input + α_platform·d_platform
-```
+The simulation implements the model from the whitepaper (`cod_matchmaking_model.md`):
 
-### Backoff Functions
-```
-f_conn(w) = min(δ_init + δ_rate·w, δ_max)
-f_skill(w) = min(σ_init + σ_rate·w, σ_max)
-```
+**Current Implementation Status**: ~Stage 1-2 (agent-based model with core matchmaking). See `COD_MM_ROADMAP.md` for detailed status and remaining work.
 
-### Win Probability
-```
-P(A wins) = σ(γ·(S_A - S_B))
-```
+**Key Components**:
+- **Player State Machine**: `OFFLINE → IN_LOBBY → SEARCHING → IN_MATCH → (IN_LOBBY | OFFLINE)`
+- **Distance Metric**: `D(j,k) = α_geo·d_geo + α_skill·d_skill + α_input·d_input + α_platform·d_platform`
+- **Backoff Functions**: `f_conn(w) = min(δ_init + δ_rate·w, δ_max)`, `f_skill(w) = min(σ_init + σ_rate·w, σ_max)`
+- **Win Probability**: `P(A wins) = σ(γ·(S_A - S_B))`
+
+**Whitepaper Mapping**:
+- Section 2.1-2.7 → `src/types.rs` (state & variables)
+- Section 3.1-3.5 → `src/matchmaker.rs` (matchmaking algorithm)
+- Section 3.6-3.8 → `src/simulation.rs` (outcomes, retention)
+- Section 6.x → Various (treatment of CoD variables)
+- Section 7 → `COD_MM_ROADMAP.md` (build order)
 
 ## 🤝 Contributing
 
