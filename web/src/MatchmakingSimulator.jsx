@@ -104,6 +104,12 @@ class SimulationEngine {
   }
 
   generatePopulation(count) {
+    // Clear existing players first
+    this.players.clear();
+    this.nextPlayerId = 0;
+    
+    console.log(`Generating population of ${count} players...`);
+    
     const regions = [
       { loc: new Location(39, -95), weight: 0.35 },
       { loc: new Location(50, 10), weight: 0.30 },
@@ -185,6 +191,7 @@ class SimulationEngine {
     }
 
     this.updateSkillPercentiles();
+    console.log(`Population generated: ${this.players.size} players`);
   }
 
   updateSkillPercentiles() {
@@ -458,7 +465,31 @@ class SimulationEngine {
         const skillDiff = (match.teamSkills[0] || 0) - (match.teamSkills[1] || 0);
         const pTeam0Wins = 1 / (1 + Math.exp(-2 * skillDiff));
         const winningTeam = this.rng() < pTeam0Wins ? 0 : 1;
-        const isBlowout = Math.abs(skillDiff) > 0.3 && this.rng() < 0.3 + Math.abs(skillDiff);
+        
+        // Blowout detection: consider both skill difference and win probability
+        // With balanced teams, skill differences are typically small (< 0.2)
+        const skillDiffAbs = Math.abs(skillDiff);
+        const winProbImbalance = Math.abs(pTeam0Wins - 0.5) * 2.0; // 0 to 1 scale
+        
+        let blowoutProb;
+        if (skillDiffAbs > 0.1) {
+          // Scale from 0.1 to 0.5 skill diff maps to 0.1 to 0.7 blowout probability
+          const skillComponent = Math.min((skillDiffAbs - 0.1) / 0.4, 1.0) * 0.4;
+          const imbalanceComponent = winProbImbalance * 0.3;
+          blowoutProb = Math.min(0.1 + skillComponent + imbalanceComponent, 0.9);
+        } else if (winProbImbalance > 0.4) {
+          // Even with small skill diff, high win probability imbalance suggests blowout risk
+          blowoutProb = winProbImbalance * 0.5;
+        } else {
+          // Small skill diff and balanced win probability - still possible but less likely
+          if (skillDiffAbs > 0.05) {
+            blowoutProb = 0.05 + winProbImbalance * 0.1;
+          } else {
+            blowoutProb = 0.02;
+          }
+        }
+        
+        const isBlowout = this.rng() < blowoutProb;
 
         if (isBlowout) this.stats.blowoutCount++;
 
@@ -699,10 +730,18 @@ export default function MatchmakingSimulator() {
   const animationRef = useRef(null);
 
   const initSimulation = useCallback(() => {
-    const newSim = new SimulationEngine(config, Date.now());
+    console.log(`Initializing simulation with population: ${population}`);
+    // Scale arrival rate with population (roughly 0.2% of population per tick, min 10, max 2000)
+    // This ensures larger populations have proportionally more players coming online
+    const scaledArrivalRate = Math.max(10, Math.min(2000, Math.round(population * 0.002)));
+    const adjustedConfig = { ...config, arrivalRate: scaledArrivalRate };
+    console.log(`Scaled arrival rate to: ${scaledArrivalRate} players/tick (${(scaledArrivalRate / population * 100).toFixed(3)}% of population)`);
+    const newSim = new SimulationEngine(adjustedConfig, Date.now());
     newSim.generatePopulation(population);
+    const stats = newSim.getStats();
+    console.log(`Simulation initialized. Total players: ${stats.totalPlayers}, Arrival rate: ${scaledArrivalRate}/tick`);
     setSim(newSim);
-    setStats(newSim.getStats());
+    setStats(stats);
     setRunning(false);
     if (animationRef.current) cancelAnimationFrame(animationRef.current);
   }, [config, population]);
@@ -712,7 +751,7 @@ export default function MatchmakingSimulator() {
     return () => {
       if (animationRef.current) cancelAnimationFrame(animationRef.current);
     };
-  }, []);
+  }, [initSimulation]);
 
   useEffect(() => {
     if (!running || !sim) return;
@@ -758,7 +797,14 @@ export default function MatchmakingSimulator() {
   };
 
   const updateConfig = (key, value) => {
-    setConfig(prev => ({ ...prev, [key]: parseFloat(value) }));
+    setConfig(prev => {
+      const newConfig = { ...prev, [key]: parseFloat(value) };
+      // If arrival rate is being updated manually, don't auto-scale it
+      if (key === 'arrivalRate') {
+        return newConfig;
+      }
+      return newConfig;
+    });
   };
 
   const formatTime = (seconds) => {
@@ -909,7 +955,7 @@ export default function MatchmakingSimulator() {
               ['deltaPingRate', 'Ping Backoff Rate', 0, 10],
               ['weightSkill', 'Skill Weight', 0, 1],
               ['weightGeo', 'Geo Weight', 0, 1],
-              ['arrivalRate', 'Arrival Rate', 1, 50],
+              ['arrivalRate', 'Arrival Rate (auto-scaled)', 1, 2000],
             ].map(([key, label, min, max]) => (
               <label key={key} style={{ display: 'block', marginBottom: '0.5rem' }}>
                 <span style={{ fontSize: '0.65rem', color: COLORS.textMuted }}>{label}: {config[key].toFixed(2)}</span>
@@ -993,11 +1039,11 @@ export default function MatchmakingSimulator() {
               {/* Stats Cards */}
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '0.75rem', marginBottom: '1rem' }}>
                 {[
+                  { label: 'Total Players', value: stats.totalPlayers || 0, color: COLORS.text, sub: `Population: ${population.toLocaleString()}` },
                   { label: 'Players Searching', value: stats.Searching, color: COLORS.warning },
                   { label: 'Players In Match', value: stats.InMatch, color: COLORS.success },
                   { label: 'Active Matches', value: stats.activeMatches, color: COLORS.tertiary },
-                  { label: 'Total Matches', value: stats.totalMatches, color: COLORS.primary },
-                ].map(({ label, value, color }) => (
+                ].map(({ label, value, color, sub }) => (
                   <div key={label} style={{
                     background: COLORS.card,
                     border: `1px solid ${COLORS.border}`,
@@ -1006,6 +1052,7 @@ export default function MatchmakingSimulator() {
                   }}>
                     <div style={{ fontSize: '0.65rem', color: COLORS.textMuted, marginBottom: '0.25rem' }}>{label}</div>
                     <div style={{ fontSize: '1.5rem', fontWeight: 700, color }}>{value.toLocaleString()}</div>
+                    {sub && <div style={{ fontSize: '0.6rem', color: COLORS.textMuted, marginTop: '0.25rem' }}>{sub}</div>}
                   </div>
                 ))}
               </div>

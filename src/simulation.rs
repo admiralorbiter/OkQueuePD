@@ -455,8 +455,37 @@ impl Simulation {
         
         let winning_team = if rng.gen_bool(p_team0_wins) { 0 } else { 1 };
         
-        // Blowout probability increases with skill difference
-        let is_blowout = skill_diff.abs() > 0.3 && rng.gen_bool(0.3 + skill_diff.abs());
+        // Blowout detection: consider both skill difference and win probability
+        // With balanced teams, skill differences are typically small (< 0.2)
+        // So we use a lower threshold and scale probability appropriately
+        let skill_diff_abs = skill_diff.abs();
+        
+        // Blowout probability based on:
+        // 1. Skill difference (even small differences can lead to blowouts)
+        // 2. Win probability imbalance (one-sided matches are more likely blowouts)
+        let win_prob_imbalance = (p_team0_wins - 0.5).abs() * 2.0; // 0 to 1 scale
+        
+        // Base blowout probability increases with skill difference and win probability imbalance
+        // Lower threshold (0.1 instead of 0.3) to catch more cases with balanced teams
+        let blowout_prob = if skill_diff_abs > 0.1 {
+            // Scale from 0.1 to 0.5 skill diff maps to 0.1 to 0.7 blowout probability
+            let skill_component = ((skill_diff_abs - 0.1) / 0.4).min(1.0) * 0.4;
+            let imbalance_component = win_prob_imbalance * 0.3;
+            (0.1 + skill_component + imbalance_component).min(0.9)
+        } else if win_prob_imbalance > 0.4 {
+            // Even with small skill diff, high win probability imbalance suggests blowout risk
+            win_prob_imbalance * 0.5
+        } else {
+            // Small skill diff and balanced win probability - still possible but less likely
+            // Add some randomness for variance in performance
+            if skill_diff_abs > 0.05 {
+                0.05 + win_prob_imbalance * 0.1
+            } else {
+                0.02
+            }
+        };
+        
+        let is_blowout = rng.gen_bool(blowout_prob);
         
         (winning_team, is_blowout)
     }
