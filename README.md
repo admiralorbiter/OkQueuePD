@@ -111,58 +111,110 @@ OkQueuePD/
 
 ## ⚙️ Configuration Parameters
 
-### Matchmaking Constraints
+> **📚 For detailed parameter documentation including effects of tweaking each variable, mathematical formulas, and tuning guidelines, see [MODEL_VARIABLES.md](docs/MODEL_VARIABLES.md)**
+
+### Connection & Ping Parameters
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `skillSimilarityInitial` | Initial skill tolerance for matching | 0.05 |
-| `skillSimilarityRate` | How fast skill tolerance relaxes | 0.01/s |
-| `skillSimilarityMax` | Maximum skill tolerance | 0.5 |
-| `deltaPingInitial` | Initial delta ping tolerance (ms) | 10 |
-| `deltaPingRate` | How fast ping tolerance relaxes | 2ms/s |
-| `deltaPingMax` | Maximum delta ping tolerance | 100ms |
-| `weightSkill` | Weight of skill in distance metric | 0.4 |
-| `weightGeo` | Weight of geography in distance metric | 0.3 |
-| `arrivalRate` | Players coming online per tick | 10 |
+| `maxPing` | Hard maximum acceptable ping to any data center (ms) | 200.0 |
+| `deltaPingInitial` | Initial delta ping tolerance (ms) | 10.0 |
+| `deltaPingRate` | Delta ping backoff rate (ms/s) | 2.0 |
+| `deltaPingMax` | Maximum delta ping tolerance after backoff (ms) | 100.0 |
 
-### Team Balancing & Outcomes
+### Skill Similarity & Disparity Parameters
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `useExactTeamBalancing` | Use exact partitioning for 6v6 modes | true |
-| `gamma` | Win probability logistic coefficient | 2.0 |
-| `blowoutSkillCoeff` | Skill difference coefficient for blowout detection | 0.8 |
-| `blowoutWinProbCoeff` | Win probability imbalance coefficient | 0.6 |
+| `skillSimilarityInitial` | Initial skill similarity tolerance (percentile units) | 0.05 |
+| `skillSimilarityRate` | Skill similarity backoff rate (percentile/s) | 0.01 |
+| `skillSimilarityMax` | Maximum skill similarity tolerance | 0.5 |
+| `maxSkillDisparityInitial` | Initial max skill disparity across lobby | 0.1 |
+| `maxSkillDisparityRate` | Skill disparity backoff rate (percentile/s) | 0.02 |
+| `maxSkillDisparityMax` | Maximum skill disparity across lobby | 0.8 |
 
-### Skill Evolution
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `enableSkillEvolution` | Enable skill updates based on performance | true |
-| `skillLearningRate` | Skill update learning rate (α) | 0.01 |
-| `performanceNoiseStd` | Standard deviation of performance noise | 0.15 |
-| `skillUpdateBatchSize` | Matches between percentile recalculations | 10 |
-
-### Retention Model
+### Distance Metric Weights
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `thetaPing` | Retention coefficient for delta ping | -0.02 |
-| `thetaSearchTime` | Retention coefficient for search time | -0.01 |
-| `thetaBlowout` | Retention coefficient for blowout rate | -0.5 |
-| `thetaWinRate` | Retention coefficient for win rate | 0.3 |
-| `thetaPerformance` | Retention coefficient for performance | 0.2 |
-| `baseContinueProb` | Base continuation probability | 0.7 |
+| `weightGeo` | Weight of geographic distance in candidate selection | 0.3 |
+| `weightSkill` | Weight of skill difference in candidate selection | 0.4 |
+| `weightInput` | Weight of input device mismatch penalty | 0.15 |
+| `weightPlatform` | Weight of platform mismatch penalty | 0.15 |
+
+### Quality Score Weights
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `qualityWeightPing` | Weight of ping quality in match quality score | 0.4 |
+| `qualityWeightSkillBalance` | Weight of skill balance in match quality score | 0.4 |
+| `qualityWeightWaitTime` | Weight of wait time fairness in match quality score | 0.2 |
+
+### Matchmaking Algorithm Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `tickInterval` | Time between matchmaking ticks (seconds) | 5.0 |
+| `numSkillBuckets` | Number of skill buckets for analytics | 10 |
+| `topKCandidates` | Number of candidates to consider per seed | 50 |
+| `arrivalRate` | Players coming online per tick (auto-scaled with population) | 10.0 |
 
 ### Party System
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `partyPlayerFraction` | Fraction of players in parties | 0.5 |
+| `partyPlayerFraction` | Fraction of players automatically assigned to parties | 0.5 |
+
+### Team Balancing & Win Probability
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `useExactTeamBalancing` | Use exact partitioning for 6v6 modes (vs. snake draft) | true |
+| `gamma` | Win probability logistic coefficient | 2.0 |
+
+### Blowout Detection Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `blowoutSkillCoefficient` | Weight of skill difference in blowout detection | 0.4 |
+| `blowoutImbalanceCoefficient` | Weight of win probability imbalance in blowout detection | 0.3 |
+| `blowoutMildThreshold` | Minimum score for Mild blowout classification | 0.15 |
+| `blowoutModerateThreshold` | Minimum score for Moderate blowout classification | 0.35 |
+| `blowoutSevereThreshold` | Minimum score for Severe blowout classification | 0.6 |
+
+### Skill Evolution Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `enableSkillEvolution` | Enable skill updates based on match performance | true |
+| `skillLearningRate` | Skill update learning rate (α) | 0.01 |
+| `performanceNoiseStd` | Standard deviation of performance noise | 0.15 |
+| `skillUpdateBatchSize` | Matches between skill percentile recalculations | 10 |
+
+### Retention Model Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `retentionConfig.thetaPing` | Retention coefficient for delta ping | -0.02 |
+| `retentionConfig.thetaSearchTime` | Retention coefficient for search time | -0.015 |
+| `retentionConfig.thetaBlowout` | Retention coefficient for blowout rate | -0.5 |
+| `retentionConfig.thetaWinRate` | Retention coefficient for win rate | 0.8 |
+| `retentionConfig.thetaPerformance` | Retention coefficient for performance | 0.6 |
+| `retentionConfig.baseContinueProb` | Base continuation probability (logit offset) | 0.0 |
+| `retentionConfig.experienceWindowSize` | Number of recent matches in experience vector | 5 |
 
 ### Regional Configuration
 
-Per-region overrides available for: `maxPing`, `deltaPingInitial`, `deltaPingRate`, `skillSimilarityInitial`, `skillSimilarityRate`
+Per-region overrides available via `regionConfigs[Region]` for:
+- `maxPing`
+- `deltaPingInitial`
+- `deltaPingRate`
+- `skillSimilarityInitial`
+- `skillSimilarityRate`
+
+Available regions: `NorthAmerica`, `Europe`, `AsiaPacific`, `SouthAmerica`, `Other`
+
+See [MODEL_VARIABLES.md](docs/MODEL_VARIABLES.md#regional-configuration-overrides) for detailed documentation.
 
 ## 📈 Key Metrics
 
@@ -223,6 +275,7 @@ The roadmap documents 6 canonical experiments ready to run:
 
 ## 📚 Documentation
 
+- **[Model Variables Reference](docs/MODEL_VARIABLES.md)**: Complete parameter documentation with defaults, effects, and tuning guidelines
 - **[Whitepaper](docs/cod_matchmaking_model.md)**: Full mathematical model specification
 - **[Implementation Roadmap](docs/COD_MM_ROADMAP.md)**: Detailed plan for completing the whitepaper implementation in vertical slices
 
